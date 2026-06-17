@@ -122,7 +122,6 @@ def wait_for_edge_debug_port(port: int, timeout: float = 8) -> bool:
 def ensure_edge_debugging(port: int = DEFAULT_BROWSER_PORT) -> None:
     if is_local_port_open(port):
         startup_log(f"edge port already open: {port}")
-        webbrowser.open(SEARCH_URL)
         return
     edge_path = find_edge_executable()
     if not edge_path:
@@ -135,6 +134,7 @@ def ensure_edge_debugging(port: int = DEFAULT_BROWSER_PORT) -> None:
         f"--user-data-dir={profile_dir}",
         "--no-first-run",
         "--no-default-browser-check",
+        "--new-window",
         SEARCH_URL,
     ]
     startup_log(f"starting edge: path={edge_path}, profile={profile_dir}, port={port}")
