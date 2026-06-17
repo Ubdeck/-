@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -17,6 +18,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
+from urllib.request import urlopen
 
 from liepin_search import DEFAULT_MATCH_REQUIREMENTS, LiepinSearchPage, SearchFilters
 
@@ -59,9 +61,11 @@ def is_local_port_open(port: int) -> bool:
 
 
 def find_edge_executable() -> Path | None:
-    fixed_path = Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe")
-    if fixed_path.exists():
-        return fixed_path
+    path_from_env = shutil.which("msedge") or shutil.which("msedge.exe")
+    if path_from_env:
+        candidate = Path(path_from_env)
+        if candidate.exists():
+            return candidate
     candidates = [
         Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Microsoft" / "Edge" / "Application" / "msedge.exe",
         Path(os.environ.get("PROGRAMFILES", "")) / "Microsoft" / "Edge" / "Application" / "msedge.exe",
@@ -73,8 +77,46 @@ def find_edge_executable() -> Path | None:
     return None
 
 
+def is_writable_dir(path: Path) -> bool:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / ".write_probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        return True
+    except OSError:
+        return False
+
+
 def get_edge_profile_dir(port: int) -> Path:
-    return Path(r"D:\EdgeDevTemp")
+    bases = [
+        os.environ.get("LOCALAPPDATA"),
+        os.environ.get("APPDATA"),
+        os.environ.get("TEMP") or os.environ.get("TMP"),
+        str(APP_DIR),
+    ]
+    for base in bases:
+        if not base:
+            continue
+        candidate = Path(base) / "LiepinAutomation" / f"edge_profile_{port}"
+        if is_writable_dir(candidate):
+            return candidate
+    fallback = APP_DIR / f"edge_profile_{port}"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+
+def wait_for_edge_debug_port(port: int, timeout: float = 8) -> bool:
+    deadline = time.time() + timeout
+    url = f"http://127.0.0.1:{port}/json/version"
+    while time.time() < deadline:
+        try:
+            with urlopen(url, timeout=0.8) as response:
+                if response.status == 200:
+                    return True
+        except OSError:
+            time.sleep(0.3)
+    return False
 
 
 def ensure_edge_debugging(port: int = DEFAULT_BROWSER_PORT) -> None:
@@ -86,20 +128,31 @@ def ensure_edge_debugging(port: int = DEFAULT_BROWSER_PORT) -> None:
     if not edge_path:
         raise RuntimeError("未找到 Microsoft Edge，请先安装 Edge 后再启动程序。")
     profile_dir = get_edge_profile_dir(port)
-    profile_dir.mkdir(parents=True, exist_ok=True)
     args = [
         str(edge_path),
+        "--remote-debugging-address=127.0.0.1",
         f"--remote-debugging-port={port}",
         f"--user-data-dir={profile_dir}",
+        "--no-first-run",
+        "--no-default-browser-check",
         SEARCH_URL,
     ]
     startup_log(f"starting edge: path={edge_path}, profile={profile_dir}, port={port}")
-    subprocess.Popen(
-        args,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=EDGE_CREATION_FLAGS,
-    )
+    try:
+        subprocess.Popen(
+            args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=EDGE_CREATION_FLAGS,
+        )
+    except OSError as exc:
+        startup_log(f"edge direct launch failed: {exc}; trying shell start")
+        subprocess.Popen(
+            ["cmd", "/c", "start", "", *args],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
     startup_log(f"edge launch command sent: port={port}")
 
 
