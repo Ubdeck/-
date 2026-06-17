@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import os
 import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -17,8 +19,9 @@ from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import urllib.error
+import urllib.request
 from urllib.parse import urlparse
-from urllib.request import urlopen
 
 from liepin_search import DEFAULT_MATCH_REQUIREMENTS, LiepinSearchPage, SearchFilters
 
@@ -36,18 +39,22 @@ DEFAULT_REQUIREMENTS = DEFAULT_MATCH_REQUIREMENTS
 DEFAULT_BROWSER_PORT = 9224
 SEARCH_URL = "https://lpt.liepin.com/search"
 STARTUP_LOG_PATH = APP_DIR / "startup.log"
-EDGE_CREATION_FLAGS = (
-    subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
-    if os.name == "nt"
-    else 0
-)
+BROWSER_CANDIDATES = [
+    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+]
 
 
 def startup_log(message: str) -> None:
     try:
-        existing = STARTUP_LOG_PATH.read_text(encoding="utf-8") if STARTUP_LOG_PATH.exists() else ""
+        log_dir = APP_DIR / "runtime"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / "launcher.log"
+        existing = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
         line = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {message}\n"
-        STARTUP_LOG_PATH.write_text(existing + line, encoding="utf-8")
+        log_path.write_text(existing + line, encoding="utf-8")
     except OSError:
         pass
 
@@ -77,6 +84,25 @@ def find_edge_executable() -> Path | None:
     return None
 
 
+def browser_launch_env() -> dict:
+    env = os.environ.copy()
+    for key in list(env.keys()):
+        upper_key = key.upper()
+        if upper_key.startswith("PYINSTALLER_") or upper_key in {"_MEIPASS2", "PYTHONHOME", "PYTHONPATH"}:
+            env.pop(key, None)
+    return env
+
+
+def reset_windows_dll_dir() -> None:
+    if os.name != "nt":
+        return
+    try:
+        ctypes.windll.kernel32.SetDllDirectoryW(None)
+        startup_log("reset_windows_dll_dir applied")
+    except Exception as exc:
+        startup_log(f"reset_windows_dll_dir failed: {exc}")
+
+
 def is_writable_dir(path: Path) -> bool:
     try:
         path.mkdir(parents=True, exist_ok=True)
@@ -88,83 +114,114 @@ def is_writable_dir(path: Path) -> bool:
         return False
 
 
-def get_edge_profile_dir(port: int) -> Path:
-    bases = [
-        os.environ.get("LOCALAPPDATA"),
-        os.environ.get("APPDATA"),
-        os.environ.get("TEMP") or os.environ.get("TMP"),
-        str(APP_DIR),
-    ]
-    for base in bases:
-        if not base:
-            continue
-        candidate = Path(base) / "LiepinAutomation" / f"edge_profile_{port}"
+def browser_runtime_dir() -> Path:
+    bundled_runtime = APP_DIR / "runtime"
+    local_app_data = Path.home() / "AppData" / "Local" / "liepin-auto-runtime"
+    home_fallback = Path.home() / ".liepin-auto-runtime"
+    temp_fallback = Path(tempfile.gettempdir()) / "liepin-auto-runtime"
+    candidates = [bundled_runtime]
+    if not is_writable_dir(bundled_runtime):
+        candidates.extend([local_app_data, home_fallback, temp_fallback])
+    for candidate in candidates:
         if is_writable_dir(candidate):
             return candidate
-    fallback = APP_DIR / f"edge_profile_{port}"
-    fallback.mkdir(parents=True, exist_ok=True)
-    return fallback
+    raise RuntimeError("无法创建浏览器运行目录，请检查当前用户目录写入权限。")
 
 
-def wait_for_edge_debug_port(port: int, timeout: float = 8) -> bool:
-    deadline = time.time() + timeout
-    url = f"http://127.0.0.1:{port}/json/version"
-    while time.time() < deadline:
-        try:
-            with urlopen(url, timeout=0.8) as response:
-                if response.status == 200:
-                    return True
-        except OSError:
-            time.sleep(0.3)
-    return False
+def request_local(path: str, timeout: float = 1.0) -> str:
+    req = urllib.request.Request(url=path, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return response.read().decode("utf-8")
 
 
-def ensure_edge_debugging(port: int = DEFAULT_BROWSER_PORT) -> None:
-    if is_local_port_open(port):
-        startup_log(f"edge port already open: {port}")
-        return
-    edge_path = find_edge_executable()
-    if not edge_path:
-        raise RuntimeError("未找到 Microsoft Edge，请先安装 Edge 后再启动程序。")
-    profile_dir = get_edge_profile_dir(port)
-    args = [
-        str(edge_path),
-        "--remote-debugging-address=127.0.0.1",
+def debug_browser_ready(port: int = DEFAULT_BROWSER_PORT, timeout: float = 1.0) -> bool:
+    try:
+        request_local(f"http://127.0.0.1:{port}/json/version", timeout=timeout)
+        return True
+    except Exception:
+        return False
+
+
+def debug_browser_ready_stable(port: int = DEFAULT_BROWSER_PORT, checks: int = 2, interval: float = 0.3, timeout: float = 0.8) -> bool:
+    for _ in range(checks):
+        if not debug_browser_ready(port=port, timeout=timeout):
+            return False
+        time.sleep(interval)
+    return True
+
+
+def launch_browser_candidate(browser_path: str, profile_dir: Path, port: int, extra_args: list[str] | None = None) -> bool:
+    launch_args = [
+        browser_path,
         f"--remote-debugging-port={port}",
         f"--user-data-dir={profile_dir}",
-        "--no-first-run",
-        "--no-default-browser-check",
         "--new-window",
         SEARCH_URL,
     ]
-    startup_log(f"starting edge: path={edge_path}, profile={profile_dir}, port={port}")
-    try:
-        subprocess.Popen(
-            args,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=EDGE_CREATION_FLAGS,
-        )
-    except OSError as exc:
-        startup_log(f"edge direct launch failed: {exc}; trying shell start")
-        subprocess.Popen(
-            ["cmd", "/c", "start", "", *args],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-        )
-    startup_log(f"edge launch command sent: port={port}")
+    if extra_args:
+        launch_args[1:1] = extra_args
+    startup_log(f"launch candidate args={' '.join(launch_args[1:])}")
+    subprocess.Popen(
+        launch_args,
+        env=browser_launch_env(),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    for _ in range(18):
+        if debug_browser_ready_stable(port=port, checks=2, interval=0.3, timeout=0.8):
+            startup_log(f"browser candidate ready: {browser_path}")
+            return True
+        time.sleep(0.5)
+    startup_log(f"browser candidate not ready: {browser_path}")
+    return False
 
 
-def edge_watchdog_loop(port: int = DEFAULT_BROWSER_PORT) -> None:
-    while not STATE.stop_event.is_set():
-        if not is_local_port_open(port):
+def verify_debug_browser_async(port: int = DEFAULT_BROWSER_PORT) -> None:
+    def worker() -> None:
+        for _ in range(20):
+            if debug_browser_ready_stable(port=port, checks=2, interval=0.3, timeout=0.8):
+                startup_log(f"debug browser ready on {port}")
+                return
+            time.sleep(0.5)
+        startup_log(f"debug browser not ready on {port} after async verification")
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def ensure_edge_debugging(port: int = DEFAULT_BROWSER_PORT) -> None:
+    if debug_browser_ready_stable(port=port, checks=2, interval=0.4, timeout=0.8):
+        startup_log(f"debug browser already ready on {port}")
+        return
+    reset_windows_dll_dir()
+    runtime_dir = browser_runtime_dir()
+    profile_dir = runtime_dir / f"browser-profile-{port}"
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    startup_log(f"ensure_debug_browser runtime_dir={runtime_dir} profile_dir={profile_dir}")
+    launch_variants = [
+        [],
+        ["--remote-debugging-address=127.0.0.1"],
+    ]
+    browser_paths: list[str] = []
+    found = find_edge_executable()
+    if found:
+        browser_paths.append(str(found))
+    for candidate in BROWSER_CANDIDATES:
+        if candidate not in browser_paths:
+            browser_paths.append(candidate)
+    for browser_path in browser_paths:
+        if not Path(browser_path).exists():
+            startup_log(f"browser candidate missing: {browser_path}")
+            continue
+        for extra_args in launch_variants:
             try:
-                startup_log(f"edge watchdog relaunching port: {port}")
-                ensure_edge_debugging(port)
+                startup_log(f"trying browser candidate: {browser_path} extra={extra_args}")
+                if launch_browser_candidate(browser_path, profile_dir, port, extra_args):
+                    return
             except Exception as exc:
-                startup_log(f"edge watchdog failed: {exc}")
-        STATE.stop_event.wait(10)
+                startup_log(f"spawn failed for {browser_path} extra={extra_args}: {exc}")
+                continue
+    startup_log("no browser candidate could be confirmed")
+    verify_debug_browser_async(port)
 
 
 OPTION_GROUPS = {
@@ -1440,7 +1497,7 @@ def main() -> None:
     parser.add_argument("--no-browser", action="store_true")
     args = parser.parse_args()
 
-    ensure_edge_debugging(DEFAULT_BROWSER_PORT)
+    threading.Thread(target=ensure_edge_debugging, args=(DEFAULT_BROWSER_PORT,), daemon=True).start()
     threading.Thread(target=STATE.scheduler_loop, daemon=True).start()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     url = f"http://{args.host}:{args.port}"

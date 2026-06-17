@@ -8,6 +8,7 @@ dist/
 *.out
 *.err
 edge_profile_*/
+runtime/
 
 liepin_web_config.json
 liepin_jobs.json
