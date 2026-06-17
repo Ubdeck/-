@@ -23,7 +23,9 @@ import urllib.error
 import urllib.request
 from urllib.parse import urlparse
 
-from liepin_search import DEFAULT_MATCH_REQUIREMENTS, LiepinSearchPage, SearchFilters
+from DrissionPage import Chromium
+
+from liepin_search import DEFAULT_MATCH_REQUIREMENTS, LiepinSearchPage, SearchFilters, make_chromium_options
 
 
 def get_app_dir() -> Path:
@@ -192,6 +194,16 @@ def ensure_edge_debugging(port: int = DEFAULT_BROWSER_PORT) -> None:
     if debug_browser_ready_stable(port=port, checks=2, interval=0.4, timeout=0.8):
         startup_log(f"debug browser already ready on {port}")
         return
+    try:
+        startup_log(f"starting browser with DrissionPage options on {port}")
+        browser = Chromium(make_chromium_options(port))
+        page = browser.latest_tab
+        page.get(SEARCH_URL)
+        if debug_browser_ready_stable(port=port, checks=2, interval=0.3, timeout=0.8):
+            startup_log(f"DrissionPage browser ready on {port}")
+            return
+    except Exception as exc:
+        startup_log(f"DrissionPage browser launch failed: {exc}")
     reset_windows_dll_dir()
     runtime_dir = browser_runtime_dir()
     profile_dir = runtime_dir / f"browser-profile-{port}"
@@ -222,6 +234,21 @@ def ensure_edge_debugging(port: int = DEFAULT_BROWSER_PORT) -> None:
                 continue
     startup_log("no browser candidate could be confirmed")
     verify_debug_browser_async(port)
+
+
+def ensure_debug_browser_for_work(port: int = DEFAULT_BROWSER_PORT, timeout: float = 35) -> bool:
+    if debug_browser_ready_stable(port=port, checks=2, interval=0.3, timeout=0.8):
+        return True
+    startup_log(f"work requested debug browser, launching port={port}")
+    ensure_edge_debugging(port)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if debug_browser_ready_stable(port=port, checks=2, interval=0.3, timeout=0.8):
+            startup_log(f"debug browser ready for work on {port}")
+            return True
+        time.sleep(0.5)
+    startup_log(f"debug browser not ready for work on {port} after {timeout}s")
+    return False
 
 
 OPTION_GROUPS = {
@@ -489,6 +516,9 @@ class AppState:
                 self.running = True
                 self.running_task = "刷新职位"
             self.add_log("正在获取职位列表...")
+            self.add_log(f"正在确认 {port} 浏览器调试端口...")
+            if not ensure_debug_browser_for_work(port):
+                raise RuntimeError(f"浏览器调试端口 {port} 未就绪，请确认自动化浏览器已打开。")
             page = LiepinSearchPage(port=port)
             jobs = page.fetch_job_list()
             self.add_log(f"已获取 {len(jobs)} 个职位。")
@@ -515,6 +545,9 @@ class AppState:
                 self.results = []
             self.add_log(f"开始运行任务：{task.get('name', '')}（{reason}）")
             filters, port = build_filters(task.get("config") or {})
+            self.add_log(f"正在确认 {port} 浏览器调试端口...")
+            if not ensure_debug_browser_for_work(port):
+                raise RuntimeError(f"浏览器调试端口 {port} 未就绪，请确认自动化浏览器已打开。")
             page = LiepinSearchPage(port=port, progress_callback=self.progress)
             self.add_log("正在获取职位列表...")
             jobs = page.fetch_job_list()

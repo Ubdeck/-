@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sys
 import time
 from dataclasses import dataclass
@@ -32,6 +33,49 @@ def get_app_dir() -> Path:
 
 
 APP_DIR = get_app_dir()
+
+
+def find_browser_executable() -> Path | None:
+    path_from_env = shutil.which("msedge") or shutil.which("msedge.exe")
+    if path_from_env:
+        candidate = Path(path_from_env)
+        if candidate.exists():
+            return candidate
+    candidates = [
+        Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Microsoft" / "Edge" / "Application" / "msedge.exe",
+        Path(os.environ.get("PROGRAMFILES", "")) / "Microsoft" / "Edge" / "Application" / "msedge.exe",
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "Edge" / "Application" / "msedge.exe",
+        Path(os.environ.get("PROGRAMFILES", "")) / "Google" / "Chrome" / "Application" / "chrome.exe",
+        Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Google" / "Chrome" / "Application" / "chrome.exe",
+    ]
+    return next((candidate for candidate in candidates if candidate.exists()), None)
+
+
+def browser_profile_dir(port: int = DEFAULT_BROWSER_PORT) -> Path:
+    base = APP_DIR / "runtime"
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+        probe = base / ".write_probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+    except OSError:
+        base = Path(os.environ.get("TEMP") or os.environ.get("TMP") or str(APP_DIR)) / "liepin-auto-runtime"
+        base.mkdir(parents=True, exist_ok=True)
+    profile = base / f"browser-profile-{port}"
+    profile.mkdir(parents=True, exist_ok=True)
+    return profile
+
+
+def make_chromium_options(port: int = DEFAULT_BROWSER_PORT) -> ChromiumOptions:
+    options = ChromiumOptions().set_local_port(port)
+    browser_path = find_browser_executable()
+    if browser_path:
+        options.set_browser_path(str(browser_path))
+    options.set_user_data_path(str(browser_profile_dir(port)))
+    options.set_argument("--new-window")
+    options.set_argument("--no-first-run")
+    options.set_argument("--no-default-browser-check")
+    return options
 
 KEYWORDS_PLACEHOLDER = "\u641c\u804c\u4f4d/\u516c\u53f8/\u884c\u4e1a\u7b49\uff08\u4e2d\u6587\u7528\u7a7a\u683c\u9694\u5f00\uff0c\u82f1\u6587\u7528\u9017\u53f7\u9694\u5f00\uff09"
 JOB_PLACEHOLDER = "\u641c\u7d22\u804c\u4f4d"
@@ -116,7 +160,7 @@ class LiepinSearchPage:
     """
 
     def __init__(self, port: int = DEFAULT_BROWSER_PORT, progress_callback=None) -> None:
-        options = ChromiumOptions().set_local_port(port)
+        options = make_chromium_options(port)
         self.browser = Chromium(options)
         self.page = self.browser.latest_tab
         self.progress = BatchProgress(progress_callback)
