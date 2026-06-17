@@ -33,6 +33,21 @@ JOBS_PATH = APP_DIR / "liepin_jobs.json"
 DEFAULT_REQUIREMENTS = DEFAULT_MATCH_REQUIREMENTS
 DEFAULT_BROWSER_PORT = 9224
 SEARCH_URL = "https://lpt.liepin.com/search"
+STARTUP_LOG_PATH = APP_DIR / "startup.log"
+EDGE_CREATION_FLAGS = (
+    subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+    if os.name == "nt"
+    else 0
+)
+
+
+def startup_log(message: str) -> None:
+    try:
+        existing = STARTUP_LOG_PATH.read_text(encoding="utf-8") if STARTUP_LOG_PATH.exists() else ""
+        line = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {message}\n"
+        STARTUP_LOG_PATH.write_text(existing + line, encoding="utf-8")
+    except OSError:
+        pass
 
 
 def is_local_port_open(port: int) -> bool:
@@ -44,6 +59,9 @@ def is_local_port_open(port: int) -> bool:
 
 
 def find_edge_executable() -> Path | None:
+    fixed_path = Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe")
+    if fixed_path.exists():
+        return fixed_path
     candidates = [
         Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Microsoft" / "Edge" / "Application" / "msedge.exe",
         Path(os.environ.get("PROGRAMFILES", "")) / "Microsoft" / "Edge" / "Application" / "msedge.exe",
@@ -55,33 +73,45 @@ def find_edge_executable() -> Path | None:
     return None
 
 
+def get_edge_profile_dir(port: int) -> Path:
+    return Path(r"D:\EdgeDevTemp")
+
+
 def ensure_edge_debugging(port: int = DEFAULT_BROWSER_PORT) -> None:
     if is_local_port_open(port):
+        startup_log(f"edge port already open: {port}")
+        webbrowser.open(SEARCH_URL)
         return
     edge_path = find_edge_executable()
     if not edge_path:
         raise RuntimeError("未找到 Microsoft Edge，请先安装 Edge 后再启动程序。")
-    profile_dir = APP_DIR / f"edge_profile_{port}"
+    profile_dir = get_edge_profile_dir(port)
     profile_dir.mkdir(parents=True, exist_ok=True)
+    args = [
+        str(edge_path),
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={profile_dir}",
+        SEARCH_URL,
+    ]
+    startup_log(f"starting edge: path={edge_path}, profile={profile_dir}, port={port}")
     subprocess.Popen(
-        [
-            str(edge_path),
-            f"--remote-debugging-port={port}",
-            f"--user-data-dir={profile_dir}",
-            "--no-first-run",
-            "--no-default-browser-check",
-            SEARCH_URL,
-        ],
+        args,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        creationflags=EDGE_CREATION_FLAGS,
     )
-    deadline = time.time() + 20
-    while time.time() < deadline:
-        if is_local_port_open(port):
-            return
-        time.sleep(0.3)
-    raise RuntimeError(f"Edge 已启动，但 127.0.0.1:{port} 调试端口未就绪。")
+    startup_log(f"edge launch command sent: port={port}")
+
+
+def edge_watchdog_loop(port: int = DEFAULT_BROWSER_PORT) -> None:
+    while not STATE.stop_event.is_set():
+        if not is_local_port_open(port):
+            try:
+                startup_log(f"edge watchdog relaunching port: {port}")
+                ensure_edge_debugging(port)
+            except Exception as exc:
+                startup_log(f"edge watchdog failed: {exc}")
+        STATE.stop_event.wait(10)
 
 
 OPTION_GROUPS = {
