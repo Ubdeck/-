@@ -10,6 +10,14 @@ if (-not (Test-Path $python)) {
 
 & $python -m pip install pyinstaller -i https://pypi.tuna.tsinghua.edu.cn/simple
 
-& $python -m PyInstaller --noconfirm --clean --onefile --name LiepinAutomation run.py
+& $python -m PyInstaller --noconfirm --clean --onedir --name LiepinAutomation --collect-all DrissionPage --hidden-import DrissionPage run.py
 
-Write-Host "打包完成：$root\dist\LiepinAutomation.exe"
+$launcher = Join-Path $root "dist\LiepinAutomation\run_portable.bat"
+@"
+@echo off
+setlocal
+cd /d "%~dp0"
+start "" ".\LiepinAutomation.exe"
+"@ | Set-Content -Path $launcher -Encoding ASCII
+
+Write-Host "打包完成：$root\dist\LiepinAutomation\run_portable.bat"

@@ -23,9 +23,7 @@ import urllib.error
 import urllib.request
 from urllib.parse import urlparse
 
-from DrissionPage import Chromium
-
-from liepin_search import DEFAULT_MATCH_REQUIREMENTS, LiepinSearchPage, SearchFilters, make_chromium_options
+from liepin_search import DEFAULT_MATCH_REQUIREMENTS, LiepinSearchPage, SearchFilters
 
 
 def get_app_dir() -> Path:
@@ -169,7 +167,7 @@ def launch_browser_candidate(browser_path: str, profile_dir: Path, port: int, ex
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    for _ in range(18):
+    for _ in range(30):
         if debug_browser_ready_stable(port=port, checks=2, interval=0.3, timeout=0.8):
             startup_log(f"browser candidate ready: {browser_path}")
             return True
@@ -194,16 +192,6 @@ def ensure_edge_debugging(port: int = DEFAULT_BROWSER_PORT) -> None:
     if debug_browser_ready_stable(port=port, checks=2, interval=0.4, timeout=0.8):
         startup_log(f"debug browser already ready on {port}")
         return
-    try:
-        startup_log(f"starting browser with DrissionPage options on {port}")
-        browser = Chromium(make_chromium_options(port))
-        page = browser.latest_tab
-        page.get(SEARCH_URL)
-        if debug_browser_ready_stable(port=port, checks=2, interval=0.3, timeout=0.8):
-            startup_log(f"DrissionPage browser ready on {port}")
-            return
-    except Exception as exc:
-        startup_log(f"DrissionPage browser launch failed: {exc}")
     reset_windows_dll_dir()
     runtime_dir = browser_runtime_dir()
     profile_dir = runtime_dir / f"browser-profile-{port}"
@@ -239,8 +227,7 @@ def ensure_edge_debugging(port: int = DEFAULT_BROWSER_PORT) -> None:
 def ensure_debug_browser_for_work(port: int = DEFAULT_BROWSER_PORT, timeout: float = 35) -> bool:
     if debug_browser_ready_stable(port=port, checks=2, interval=0.3, timeout=0.8):
         return True
-    startup_log(f"work requested debug browser, launching port={port}")
-    ensure_edge_debugging(port)
+    startup_log(f"work requested debug browser, waiting port={port}")
     deadline = time.time() + timeout
     while time.time() < deadline:
         if debug_browser_ready_stable(port=port, checks=2, interval=0.3, timeout=0.8):
@@ -1221,6 +1208,7 @@ let optionPickerKind = "industry";
 let optionPickerTarget = "current";
 let optionPickerCategory = "";
 let optionPickerDraft = [];
+let refreshJobsTimer = null;
 const fieldIds = [
   "port", "keywords", "job_name", "company_name", "current_city", "expected_city",
   "experience", "education", "recruitment_type", "active_status", "job_status",
@@ -1248,6 +1236,7 @@ async function loadState(keepForm = false) {
   renderLogs();
   document.getElementById("status").textContent = state.running ? `运行中：${state.running_task}` : "准备就绪";
   if (!keepForm) fillForm(activeTask());
+  else renderJobSelect();
 }
 function activeTask() {
   return (state.tasks || []).find(t => t.id === activeTaskId) || state.tasks[0];
@@ -1267,6 +1256,17 @@ function renderTasks() {
 function fillSelect(id, selected) {
   document.getElementById(id).innerHTML = optionHtml(state.options[id] || [""], selected || "");
 }
+function renderJobSelect(cfg = null) {
+  const jobSelect = document.getElementById("selected_chat_job");
+  if (!jobSelect) return;
+  const currentLabel = jobSelect.value || "";
+  const configLabel = cfg && cfg.selected_chat_job ? formatJobLabel(cfg.selected_chat_job) : "";
+  const selectedJobLabel = currentLabel || configLabel;
+  jobSelect.innerHTML = `<option value="">自动选择第一个职位</option>` + (state.jobs || []).map(job => {
+    const label = formatJobLabel(job);
+    return `<option value="${escapeHtml(label)}"${label === selectedJobLabel ? " selected" : ""}>${escapeHtml(label)}</option>`;
+  }).join("");
+}
 function fillForm(task) {
   if (!task) return;
   const cfg = {...state.defaults, ...(task.config || {})};
@@ -1275,12 +1275,7 @@ function fillForm(task) {
   scheduleTimes = normalizeTimes(task.times || []);
   renderScheduleTimes();
   for (const id of Object.keys(state.options || {})) fillSelect(id, cfg[id]);
-  const jobSelect = document.getElementById("selected_chat_job");
-  const selectedJobLabel = cfg.selected_chat_job ? formatJobLabel(cfg.selected_chat_job) : "";
-  jobSelect.innerHTML = `<option value="">自动选择第一个职位</option>` + (state.jobs || []).map(job => {
-    const label = formatJobLabel(job);
-    return `<option value="${escapeHtml(label)}"${label === selectedJobLabel ? " selected" : ""}>${escapeHtml(label)}</option>`;
-  }).join("");
+  renderJobSelect(cfg);
   const schools = ["211", "985", "双一流", "海外留学"];
   document.getElementById("school_types").innerHTML = schools.map(label => {
     const checked = (cfg.school_types || []).includes(label) ? "checked" : "";
@@ -1493,7 +1488,16 @@ async function runTask() {
 async function refreshJobs() {
   const port = Number(document.getElementById("port").value || 9224);
   await api("/api/jobs/refresh", {port});
-  setTimeout(() => loadState(true), 500);
+  if (refreshJobsTimer) clearInterval(refreshJobsTimer);
+  const startedAt = Date.now();
+  refreshJobsTimer = setInterval(async () => {
+    await loadState(true);
+    if (!state.running || Date.now() - startedAt > 60000) {
+      clearInterval(refreshJobsTimer);
+      refreshJobsTimer = null;
+      await loadState(true);
+    }
+  }, 1000);
 }
 function renderResults() {
   const mapComm = {done:"已确认", already_communicated:"已沟通", failed:"失败"};
@@ -1530,7 +1534,7 @@ def main() -> None:
     parser.add_argument("--no-browser", action="store_true")
     args = parser.parse_args()
 
-    threading.Thread(target=ensure_edge_debugging, args=(DEFAULT_BROWSER_PORT,), daemon=True).start()
+    ensure_edge_debugging(DEFAULT_BROWSER_PORT)
     threading.Thread(target=STATE.scheduler_loop, daemon=True).start()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     url = f"http://{args.host}:{args.port}"
