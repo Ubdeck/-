@@ -25,6 +25,11 @@ from urllib.parse import urlparse
 
 from liepin_search import DEFAULT_MATCH_REQUIREMENTS, LiepinSearchPage, SearchFilters
 
+try:
+    import winreg
+except ImportError:
+    winreg = None
+
 
 def get_app_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -68,15 +73,30 @@ def is_local_port_open(port: int) -> bool:
 
 
 def find_edge_executable() -> Path | None:
+    registry_candidates: list[Path] = []
+    if winreg is not None and os.name == "nt":
+        registry_keys = [
+            (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe"),
+            (winreg.HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe"),
+            (winreg.HKEY_LOCAL_MACHINE, r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe"),
+        ]
+        for root, key_path in registry_keys:
+            try:
+                with winreg.OpenKey(root, key_path) as key:
+                    value, _ = winreg.QueryValueEx(key, "")
+                    registry_candidates.append(Path(value.strip('"')))
+            except OSError:
+                continue
     path_from_env = shutil.which("msedge") or shutil.which("msedge.exe")
     if path_from_env:
         candidate = Path(path_from_env)
         if candidate.exists():
             return candidate
-    candidates = [
+    candidates = registry_candidates + [
         Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Microsoft" / "Edge" / "Application" / "msedge.exe",
         Path(os.environ.get("PROGRAMFILES", "")) / "Microsoft" / "Edge" / "Application" / "msedge.exe",
         Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "Edge" / "Application" / "msedge.exe",
+        Path(os.environ.get("PROGRAMW6432", "")) / "Microsoft" / "Edge" / "Application" / "msedge.exe",
     ]
     for candidate in candidates:
         if candidate.exists():
@@ -227,7 +247,8 @@ def ensure_edge_debugging(port: int = DEFAULT_BROWSER_PORT) -> None:
 def ensure_debug_browser_for_work(port: int = DEFAULT_BROWSER_PORT, timeout: float = 35) -> bool:
     if debug_browser_ready_stable(port=port, checks=2, interval=0.3, timeout=0.8):
         return True
-    startup_log(f"work requested debug browser, waiting port={port}")
+    startup_log(f"work requested debug browser, launching port={port}")
+    ensure_edge_debugging(port)
     deadline = time.time() + timeout
     while time.time() < deadline:
         if debug_browser_ready_stable(port=port, checks=2, interval=0.3, timeout=0.8):
