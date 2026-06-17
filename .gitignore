@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+.playwright-mcp/
+build/
+dist/
+*.spec
+*.pid
+*.out
+*.err
+edge_profile_*/
+
+liepin_web_config.json
+liepin_jobs.json
+candidate_profile.json
+candidate_batch_profiles.json
+candidate_batch_summary.json
+ai_match_logs.json
