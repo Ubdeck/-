@@ -23,6 +23,8 @@ import urllib.error
 import urllib.request
 from urllib.parse import urlparse
 
+import psutil
+
 from liepin_search import DEFAULT_MATCH_REQUIREMENTS, LiepinSearchPage, SearchFilters
 
 try:
@@ -135,13 +137,10 @@ def is_writable_dir(path: Path) -> bool:
 
 
 def browser_runtime_dir() -> Path:
-    bundled_runtime = APP_DIR / "runtime"
     local_app_data = Path.home() / "AppData" / "Local" / "liepin-auto-runtime"
     home_fallback = Path.home() / ".liepin-auto-runtime"
     temp_fallback = Path(tempfile.gettempdir()) / "liepin-auto-runtime"
-    candidates = [bundled_runtime]
-    if not is_writable_dir(bundled_runtime):
-        candidates.extend([local_app_data, home_fallback, temp_fallback])
+    candidates = [local_app_data, home_fallback, temp_fallback, APP_DIR / "runtime"]
     for candidate in candidates:
         if is_writable_dir(candidate):
             return candidate
@@ -170,10 +169,57 @@ def debug_browser_ready_stable(port: int = DEFAULT_BROWSER_PORT, checks: int = 2
     return True
 
 
+def profile_in_cmdline(profile_dir: Path, cmdline: list[str] | tuple[str, ...] | None) -> bool:
+    needle = str(profile_dir).lower()
+    return bool(needle and needle in " ".join(cmdline or []).lower())
+
+
+def kill_profile_browser_processes(profile_dir: Path) -> None:
+    targets = []
+    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+        try:
+            name = (proc.info.get("name") or "").lower()
+            if name in {"msedge.exe", "chrome.exe"} and profile_in_cmdline(profile_dir, proc.info.get("cmdline")):
+                startup_log(f"stopping stale browser pid={proc.pid} profile={profile_dir}")
+                proc.terminate()
+                targets.append(proc)
+        except (psutil.Error, OSError):
+            continue
+    _, alive = psutil.wait_procs(targets, timeout=3)
+    for proc in alive:
+        try:
+            startup_log(f"killing stale browser pid={proc.pid} profile={profile_dir}")
+            proc.kill()
+        except (psutil.Error, OSError):
+            continue
+
+
+def browser_debug_diag(port: int) -> str:
+    parts = []
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+            parts.append(f"tcp:{port}=open")
+    except OSError as exc:
+        parts.append(f"tcp:{port}=closed:{exc}")
+    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+        try:
+            name = (proc.info.get("name") or "").lower()
+            cmdline = " ".join(proc.info.get("cmdline") or [])
+            if name in {"msedge.exe", "chrome.exe"} and f"--remote-debugging-port={port}" in cmdline:
+                parts.append(f"browser_pid={proc.pid} cmd={cmdline[:500]}")
+        except (psutil.Error, OSError):
+            continue
+    return " | ".join(parts)
+
+
 def launch_browser_candidate(browser_path: str, profile_dir: Path, port: int, extra_args: list[str] | None = None) -> bool:
     launch_args = [
         browser_path,
         f"--remote-debugging-port={port}",
+        "--remote-allow-origins=*",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-features=Translate,msEdgeFre",
         f"--user-data-dir={profile_dir}",
         "--new-window",
         SEARCH_URL,
@@ -181,18 +227,31 @@ def launch_browser_candidate(browser_path: str, profile_dir: Path, port: int, ex
     if extra_args:
         launch_args[1:1] = extra_args
     startup_log(f"launch candidate args={' '.join(launch_args[1:])}")
-    subprocess.Popen(
+    stderr_path = APP_DIR / "runtime" / "browser-stderr.log"
+    stderr_path.parent.mkdir(parents=True, exist_ok=True)
+    stderr_file = stderr_path.open("ab")
+    process = subprocess.Popen(
         launch_args,
         env=browser_launch_env(),
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=stderr_file,
     )
-    for _ in range(30):
+    for _ in range(45):
         if debug_browser_ready_stable(port=port, checks=2, interval=0.3, timeout=0.8):
             startup_log(f"browser candidate ready: {browser_path}")
+            stderr_file.close()
             return True
+        if process.poll() is not None:
+            startup_log(f"browser candidate exited early: {browser_path} exit={process.returncode}")
+            break
         time.sleep(0.5)
-    startup_log(f"browser candidate not ready: {browser_path}")
+    stderr_file.close()
+    stderr_tail = ""
+    try:
+        stderr_tail = stderr_path.read_text(encoding="utf-8", errors="ignore")[-1200:].replace("\r", " ").replace("\n", " ")
+    except OSError:
+        pass
+    startup_log(f"browser candidate not ready: {browser_path}; diag={browser_debug_diag(port)}; stderr_tail={stderr_tail}")
     return False
 
 
@@ -217,6 +276,7 @@ def ensure_edge_debugging(port: int = DEFAULT_BROWSER_PORT) -> None:
     profile_dir = runtime_dir / f"browser-profile-{port}"
     profile_dir.mkdir(parents=True, exist_ok=True)
     startup_log(f"ensure_debug_browser runtime_dir={runtime_dir} profile_dir={profile_dir}")
+    kill_profile_browser_processes(profile_dir)
     launch_variants = [
         [],
         ["--remote-debugging-address=127.0.0.1"],
