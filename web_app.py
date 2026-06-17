@@ -112,6 +112,8 @@ def browser_launch_env() -> dict:
         upper_key = key.upper()
         if upper_key.startswith("PYINSTALLER_") or upper_key in {"_MEIPASS2", "PYTHONHOME", "PYTHONPATH"}:
             env.pop(key, None)
+    env["NO_PROXY"] = "127.0.0.1,localhost"
+    env["no_proxy"] = "127.0.0.1,localhost"
     return env
 
 
@@ -149,7 +151,8 @@ def browser_runtime_dir() -> Path:
 
 def request_local(path: str, timeout: float = 1.0) -> str:
     req = urllib.request.Request(url=path, method="GET")
-    with urllib.request.urlopen(req, timeout=timeout) as response:
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(req, timeout=timeout) as response:
         return response.read().decode("utf-8")
 
 
@@ -157,7 +160,9 @@ def debug_browser_ready(port: int = DEFAULT_BROWSER_PORT, timeout: float = 1.0) 
     try:
         request_local(f"http://127.0.0.1:{port}/json/version", timeout=timeout)
         return True
-    except Exception:
+    except Exception as exc:
+        if is_local_port_open(port):
+            startup_log(f"debug browser tcp open but http check failed on {port}: {exc}")
         return False
 
 

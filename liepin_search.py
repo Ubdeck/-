@@ -48,7 +48,8 @@ def append_runtime_log(message: str) -> None:
 
 
 def fetch_json(url: str, timeout: float = 1.5):
-    with request.urlopen(url, timeout=timeout) as response:
+    opener = request.build_opener(request.ProxyHandler({}))
+    with opener.open(url, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
