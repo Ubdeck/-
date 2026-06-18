@@ -96,6 +96,64 @@ def wait_page_target_ready(port: int = DEFAULT_BROWSER_PORT, timeout: float = 25
     )
 
 
+def wait_debug_port_ready(port: int = DEFAULT_BROWSER_PORT, timeout: float = 25.0) -> str:
+    append_runtime_log(f"wait_debug_port_ready start port={port} timeout={timeout}")
+    end_at = time.time() + timeout
+    last_error = ""
+    # DrissionPage rewrites localhost to 127.0.0.1 internally. Prefer the
+    # explicit IPv6 loopback first because some Edge builds bind DevTools there.
+    candidates = ("[::1]", "127.0.0.1", "localhost")
+    while time.time() < end_at:
+        errors = []
+        for host in candidates:
+            try:
+                fetch_json(f"http://{host}:{port}/json/version", timeout=1.2)
+                address = f"{host}:{port}"
+                append_runtime_log(f"wait_debug_port_ready ok address={address}")
+                return address
+            except Exception as exc:
+                errors.append(f"{host}: {exc}")
+        last_error = "; ".join(errors)
+        time.sleep(0.4)
+    append_runtime_log(f"wait_debug_port_ready fail port={port} error={last_error}")
+    raise RuntimeError(
+        f"浏览器连接失败，请检查 {port} 端口是否为浏览器，且已添加 "
+        f"\"--remote-debugging-port={port}\" 启动项。"
+        f"\n已尝试地址: 127.0.0.1:{port}, localhost:{port}, [::1]:{port}"
+        f"\n最后错误: {last_error or 'unknown'}"
+    )
+
+
+def wait_page_target_ready(address: str, timeout: float = 25.0) -> None:
+    append_runtime_log(f"wait_page_target_ready start address={address} timeout={timeout}")
+    end_at = time.time() + timeout
+    last_error = ""
+    while time.time() < end_at:
+        try:
+            targets = fetch_json(f"http://{address}/json/list", timeout=1.2)
+            if any(item.get("type") == "page" for item in targets):
+                append_runtime_log(f"wait_page_target_ready ok address={address} targets={len(targets)}")
+                return
+            last_error = "CDP 已就绪，但还没有可接管的 page target"
+        except Exception as exc:
+            last_error = str(exc)
+        time.sleep(0.4)
+    append_runtime_log(f"wait_page_target_ready fail address={address} error={last_error}")
+    raise RuntimeError(
+        f"已连接到 {address} 调试端口，但没有可接管的页面标签。"
+        f"\n最后状态: {last_error or 'unknown'}"
+    )
+
+
+def browser_websocket_url(address: str) -> str | None:
+    try:
+        version = fetch_json(f"http://{address}/json/version", timeout=1.2)
+        return version.get("webSocketDebuggerUrl")
+    except Exception as exc:
+        append_runtime_log(f"browser_websocket_url fail address={address} error={exc}")
+        return None
+
+
 def connect_chromium_page(
     search_url: str | None = None,
     port: int = DEFAULT_BROWSER_PORT,
@@ -103,9 +161,11 @@ def connect_chromium_page(
     retries: int = 5,
 ) -> ChromiumPage:
     append_runtime_log(f"connect_chromium_page start port={port} search_url={search_url or ''} retries={retries}")
-    wait_debug_port_ready(port=port, timeout=connect_timeout)
-    wait_page_target_ready(port=port, timeout=connect_timeout)
-    options = ChromiumOptions().set_local_port(port)
+    address = wait_debug_port_ready(port=port, timeout=connect_timeout)
+    wait_page_target_ready(address=address, timeout=connect_timeout)
+    ws_url = browser_websocket_url(address)
+    options = ChromiumOptions().set_address(ws_url or address)
+    append_runtime_log(f"connect_chromium_page using address={address} ws={bool(ws_url)}")
 
     last_error = None
     for index in range(retries):
@@ -180,6 +240,8 @@ class SearchFilters:
     deepseek_api_key: str = ""
     deepseek_model: str = "deepseek-chat"
     auto_communicate: bool = True
+    request_resume_after_communicate: bool = True
+    request_phone_after_communicate: bool = False
     candidate_limit: int = 1
     keywords: str = ""
     job_name: str = ""
@@ -475,6 +537,7 @@ class LiepinSearchPage:
 
     def process_candidate_batch(self, filters: SearchFilters) -> dict:
         limit = max(int(filters.candidate_limit or 1), 1)
+        batch_started_at = datetime.now()
         self.ensure_candidate_detail_open()
         results: list[dict] = []
         resume_targets: list[dict] = []
@@ -502,6 +565,7 @@ class LiepinSearchPage:
                 },
             )
             decision = self.decide_candidate_match(profile, filters)
+            time.sleep(0.6)
             profile["ai_match"] = decision
             self.append_batch_candidate(profile)
             self.progress.emit(
@@ -581,9 +645,16 @@ class LiepinSearchPage:
             "matched": sum(1 for item in results if item.get("match")),
             "results": results,
         }
-        self.progress.emit("resume_request_start", f"本轮待索要简历人数：{len(resume_targets)}")
-        if resume_targets:
-            self.request_resumes_after_batch(resume_targets, results)
+        should_request_contacts = filters.request_resume_after_communicate or filters.request_phone_after_communicate
+        self.progress.emit("resume_request_start", f"本轮待处理消息会话数：{len(resume_targets)}")
+        if resume_targets and should_request_contacts:
+            self.request_contacts_after_batch(
+                resume_targets,
+                results,
+                batch_started_at,
+                request_resume=filters.request_resume_after_communicate,
+                request_phone=filters.request_phone_after_communicate,
+            )
             summary["results"] = results
         self.save_batch_summary(results)
         return summary
@@ -597,6 +668,515 @@ class LiepinSearchPage:
         summary_path = APP_DIR / "candidate_batch_summary.json"
         with open(summary_path, "w", encoding="utf-8") as file:
             json.dump(summary, file, ensure_ascii=False, indent=2)
+
+    def request_contacts_after_batch(
+        self,
+        targets: list[dict],
+        results: list[dict],
+        started_at: datetime,
+        request_resume: bool = True,
+        request_phone: bool = False,
+    ) -> None:
+        actions = []
+        if request_phone:
+            actions.append("phone")
+        if request_resume:
+            actions.append("resume")
+        if not actions:
+            return
+
+        start_minute = started_at.hour * 60 + started_at.minute
+        self.progress.emit(
+            "resume_request_start",
+            f"开始进入消息页，处理 {started_at.strftime('%H:%M')} 之后的新会话：{len(targets)} 个",
+        )
+        self.page.get(CHAT_URL)
+        self.wait_for_chat_page()
+        self.reset_chat_list_scroll()
+
+        cards = self.collect_recent_chat_cards(start_minute, max_count=len(targets))
+        processed_count = 0
+        for opened in cards[: len(targets)]:
+            clicked = self.open_chat_card_by_signature(opened.get("signature", ""))
+            if not clicked.get("ok"):
+                self.progress.emit(
+                    "resume_request_done",
+                    f"消息卡片打开失败，跳过：{opened.get('time', '')} {opened.get('title', '')}",
+                    {"card": opened, "error": clicked},
+                )
+                continue
+
+            target = targets[processed_count]
+            index = target.get("index")
+            self.progress.emit(
+                "resume_request",
+                f"正在处理第 {index} 个已沟通会话：{opened.get('time', '')} {opened.get('title', '')}",
+                {"index": index, "card": opened},
+            )
+            time.sleep(0.8)
+
+            action_results: dict[str, dict] = {}
+            for action in actions:
+                try:
+                    action_results[action] = self.request_chat_action_in_current_chat(action)
+                except Exception as exc:
+                    action_results[action] = {"status": "failed", "message": str(exc)}
+
+            for item in results:
+                if item.get("index") == index:
+                    if request_resume:
+                        resume = action_results.get("resume") or {}
+                        item["resume_request_status"] = resume.get("status", "unknown")
+                        item["resume_request_note"] = resume.get("message", "")
+                    if request_phone:
+                        phone = action_results.get("phone") or {}
+                        item["phone_request_status"] = phone.get("status", "unknown")
+                        item["phone_request_note"] = phone.get("message", "")
+                    break
+
+            message_parts = []
+            if request_phone:
+                phone = action_results.get("phone") or {}
+                message_parts.append(f"电话：{self.contact_status_text(phone.get('status', 'unknown'))}")
+            if request_resume:
+                resume = action_results.get("resume") or {}
+                message_parts.append(f"简历：{self.contact_status_text(resume.get('status', 'unknown'))}")
+            self.progress.emit(
+                "resume_request_done",
+                f"第 {index} 个会话处理结果：{'；'.join(message_parts)}",
+                {"index": index, "actions": action_results},
+            )
+            self.save_batch_summary(results)
+            processed_count += 1
+
+        if processed_count < len(targets):
+            self.progress.emit(
+                "resume_request_done",
+                f"消息页只处理到 {processed_count}/{len(targets)} 个本轮开始后的会话，其余未处理",
+                {"processed": processed_count, "expected": len(targets), "cards": cards},
+            )
+
+    def collect_recent_chat_cards(self, start_minute: int, max_count: int) -> list[dict]:
+        return self.page.run_js(
+            """
+            const startMinute = Number(arguments[0] || 0);
+            const maxCount = Number(arguments[1] || 1);
+            const visible = ele => {
+              const rect = ele.getBoundingClientRect();
+              const style = getComputedStyle(ele);
+              return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+            };
+            const clean = value => String(value || '').replace(/\\s+/g, ' ').trim();
+            const minuteOf = text => {
+              const m = String(text || '').match(/(^|[^0-9])([01]?[0-9]|2[0-3]):([0-5][0-9])([^0-9]|$)/);
+              if (!m) return null;
+              return Number(m[2]) * 60 + Number(m[3]);
+            };
+            const ignoredTexts = ['求职者投递', '批量处理', '昨日您主动沟通', '全部职位', '消息筛选'];
+            const badCardText = text => ignoredTexts.some(item => text.includes(item));
+            const cards = [];
+            const seen = new Set();
+            const readVisibleCards = () => {
+              for (const ele of Array.from(document.querySelectorAll('.im-ui-contact-list-item')).filter(visible)) {
+                const text = clean(ele.innerText || ele.textContent);
+                const minute = minuteOf(text);
+                if (minute === null || minute < startMinute || badCardText(text)) continue;
+                const time = (text.match(/([01]?[0-9]|2[0-3]):([0-5][0-9])/) || [''])[0];
+                const title = clean(text.split(time)[0] || text).slice(0, 40);
+                const signature = `${time}|${title}`;
+                if (seen.has(signature)) continue;
+                seen.add(signature);
+                cards.push({ok: true, signature, time, title, text: text.slice(0, 160), minute});
+              }
+            };
+            readVisibleCards();
+            const scrollBox = Array.from(document.querySelectorAll('.im-ui-contacts-wrap, aside *, *'))
+              .filter(visible)
+              .filter(ele => {
+                const rect = ele.getBoundingClientRect();
+                const style = getComputedStyle(ele);
+                return rect.left < Math.min(520, window.innerWidth * 0.45)
+                  && rect.width >= 250
+                  && rect.width <= 360
+                  && rect.height > 240
+                  && ele.scrollHeight > ele.clientHeight + 20
+                  && /(auto|scroll)/.test(style.overflowY);
+              })
+              .sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight))[0];
+            let guard = 0;
+            while (scrollBox && cards.length < maxCount && guard < 12) {
+              const before = scrollBox.scrollTop;
+              scrollBox.scrollTop += Math.max(160, scrollBox.clientHeight * 0.75);
+              readVisibleCards();
+              guard += 1;
+              if (scrollBox.scrollTop === before || scrollBox.scrollTop + scrollBox.clientHeight >= scrollBox.scrollHeight - 8) break;
+            }
+            return cards.sort((a, b) => b.minute - a.minute);
+            """,
+            start_minute,
+            max_count,
+        ) or []
+
+    def open_chat_card_by_signature(self, signature: str) -> dict:
+        return self.page.run_js(
+            """
+            const signature = String(arguments[0] || '');
+            const visible = ele => {
+              const rect = ele.getBoundingClientRect();
+              const style = getComputedStyle(ele);
+              return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+            };
+            const clean = value => String(value || '').replace(/\\s+/g, ' ').trim();
+            const signatureOf = ele => {
+              const text = clean(ele.innerText || ele.textContent);
+              const time = (text.match(/([01]?[0-9]|2[0-3]):([0-5][0-9])/) || [''])[0];
+              const title = clean(text.split(time)[0] || text).slice(0, 40);
+              return `${time}|${title}`;
+            };
+            const findCard = () => Array.from(document.querySelectorAll('.im-ui-contact-list-item'))
+              .filter(visible)
+              .find(ele => signatureOf(ele) === signature);
+            let card = findCard();
+            if (!card) {
+              const scrollBox = Array.from(document.querySelectorAll('.im-ui-contacts-wrap, aside *, *'))
+                .filter(visible)
+                .filter(ele => {
+                  const rect = ele.getBoundingClientRect();
+                  const style = getComputedStyle(ele);
+                  return rect.left < Math.min(520, window.innerWidth * 0.45)
+                    && rect.width >= 250
+                    && rect.width <= 360
+                    && rect.height > 240
+                    && ele.scrollHeight > ele.clientHeight + 20
+                    && /(auto|scroll)/.test(style.overflowY);
+                })
+                .sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight))[0];
+              if (scrollBox) {
+                scrollBox.scrollTop = 0;
+                for (let i = 0; i < 18 && !card; i += 1) {
+                  card = findCard();
+                  if (card) break;
+                  scrollBox.scrollTop += Math.max(160, scrollBox.clientHeight * 0.75);
+                }
+              }
+            }
+            if (!card) return {ok: false, reason: 'card not found', signature};
+            card.scrollIntoView({block: 'center', inline: 'nearest'});
+            for (const name of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+              card.dispatchEvent(new MouseEvent(name, {bubbles: true, cancelable: true, composed: true, view: window}));
+            }
+            return {ok: true, signature};
+            """,
+            signature,
+        ) or {"ok": False, "reason": "open card script failed"}
+
+    def open_next_recent_chat_card(self, start_minute: int, processed_signatures: set[str]) -> dict:
+        processed_json = json.dumps(list(processed_signatures), ensure_ascii=False)
+        return self.page.run_js(
+            """
+            const startMinute = Number(arguments[0] || 0);
+            let processedItems = [];
+            try {
+              processedItems = JSON.parse(arguments[1] || '[]');
+            } catch {
+              processedItems = [];
+            }
+            const processed = new Set(processedItems);
+            const visible = ele => {
+              const rect = ele.getBoundingClientRect();
+              const style = getComputedStyle(ele);
+              return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+            };
+            const clean = value => String(value || '').replace(/\\s+/g, ' ').trim();
+            const minuteOf = text => {
+              const m = String(text || '').match(/(^|[^0-9])([01]?[0-9]|2[0-3]):([0-5][0-9])([^0-9]|$)/);
+              if (!m) return null;
+              return Number(m[2]) * 60 + Number(m[3]);
+            };
+            const inLeftArea = ele => {
+              const rect = ele.getBoundingClientRect();
+              const cls = String(ele.className || '');
+              if (cls.includes('im-ui-contact-list-item') || cls.includes('im-ui-contact-info')) {
+                return rect.left >= 150 && rect.left < Math.min(520, window.innerWidth * 0.45)
+                  && rect.width >= 220
+                  && rect.width <= 340
+                  && rect.height >= 55
+                  && rect.height <= 95;
+              }
+              return rect.left < Math.min(620, window.innerWidth * 0.48)
+                && rect.width >= 180
+                && rect.width <= Math.max(680, window.innerWidth * 0.55)
+                && rect.height >= 36
+                && rect.height <= 180;
+            };
+            const ignoredTexts = ['求职者投递', '批量处理', '昨日您主动沟通', '全部职位', '消息筛选'];
+            const badCardText = text => ignoredTexts.some(item => text.includes(item));
+            const primaryCards = Array.from(document.querySelectorAll('.im-ui-contact-list-item'))
+              .filter(visible)
+              .map(ele => {
+                const text = clean(ele.innerText || ele.textContent);
+                const minute = minuteOf(text);
+                const rect = ele.getBoundingClientRect();
+                const time = (text.match(/([01]?[0-9]|2[0-3]):([0-5][0-9])/) || [''])[0];
+                const title = clean(text.split(time)[0] || text).slice(0, 40);
+                const signature = `${time}|${title}`;
+                return {ele, text, minute, time, title, signature, top: rect.top};
+              })
+              .filter(item => item.minute !== null)
+              .filter(item => item.minute >= startMinute)
+              .filter(item => !badCardText(item.text))
+              .filter(item => !processed.has(item.signature))
+              .sort((a, b) => b.minute - a.minute || a.top - b.top);
+            const primaryCard = primaryCards[0];
+            if (primaryCard) {
+              primaryCard.ele.scrollIntoView({block: 'center', inline: 'nearest'});
+              for (const name of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                primaryCard.ele.dispatchEvent(new MouseEvent(name, {
+                  bubbles: true,
+                  cancelable: true,
+                  composed: true,
+                  view: window,
+                }));
+              }
+              return {ok: true, signature: primaryCard.signature, time: primaryCard.time, title: primaryCard.title, text: primaryCard.text.slice(0, 160)};
+            }
+            if (document.querySelectorAll('.im-ui-contact-list-item').length > 0) {
+              return {
+                ok: false,
+                reason: 'no recent chat card found',
+                debug: {
+                  startMinute,
+                  processed: Array.from(processed),
+                  total: document.querySelectorAll('.im-ui-contact-list-item').length,
+                  samples: Array.from(document.querySelectorAll('.im-ui-contact-list-item')).slice(0, 8).map(ele => {
+                    const text = clean(ele.innerText || ele.textContent);
+                    return {text: text.slice(0, 120), minute: minuteOf(text), ignored: badCardText(text)};
+                  }),
+                },
+              };
+            }
+            const resolveCard = ele => {
+              const direct = ele.closest('.im-ui-contact-list-item, .im-ui-contact-info');
+              if (direct) return direct;
+              for (let node = ele; node && node !== document.body; node = node.parentElement) {
+                const rect = node.getBoundingClientRect();
+                const cls = String(node.className || '');
+                if ((cls.includes('contact') || cls.includes('item') || cls.includes('card') || cls.includes('session') || cls.includes('conversation'))
+                  && rect.left >= 150 && rect.left < Math.min(520, window.innerWidth * 0.45)
+                  && rect.width >= 220 && rect.width <= 360 && rect.height >= 55 && rect.height <= 120) {
+                  return node;
+                }
+              }
+              return ele;
+            };
+            const primaryNodes = Array.from(document.querySelectorAll('.im-ui-contact-list-item'));
+            const fallbackNodes = Array.from(document.querySelectorAll('.im-ui-contact-info, li, [class*=item], [class*=card], [class*=session], [class*=conversation], [class*=list] > div'));
+            const rawNodes = primaryNodes.length ? primaryNodes : fallbackNodes;
+            const uniqueNodes = Array.from(new Set(rawNodes.map(resolveCard)));
+            const cardNodes = uniqueNodes
+              .filter(visible)
+              .filter(inLeftArea)
+              .map(ele => {
+                const text = clean(ele.innerText || ele.textContent);
+                const minute = minuteOf(text);
+                const rect = ele.getBoundingClientRect();
+                const time = (text.match(/([01]?[0-9]|2[0-3]):([0-5][0-9])/) || [''])[0];
+                const title = clean(text.split(time)[0] || text).slice(0, 40);
+                const signature = `${time}|${title}`;
+                return {ele, text, minute, time, title, signature, top: rect.top};
+              })
+              .filter(item => item.minute !== null)
+              .filter(item => item.minute >= startMinute)
+              .filter(item => !badCardText(item.text))
+              .filter(item => !processed.has(item.signature))
+              .sort((a, b) => b.minute - a.minute || a.top - b.top);
+            const card = cardNodes[0];
+            if (card) {
+              card.ele.scrollIntoView({block: 'center', inline: 'nearest'});
+              for (const name of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                card.ele.dispatchEvent(new MouseEvent(name, {
+                  bubbles: true,
+                  cancelable: true,
+                  composed: true,
+                  view: window,
+                }));
+              }
+              return {ok: true, signature: card.signature, time: card.time, title: card.title, text: card.text.slice(0, 160)};
+            }
+            const scrollBox = Array.from(document.querySelectorAll('*'))
+              .filter(visible)
+              .filter(ele => {
+                const rect = ele.getBoundingClientRect();
+                const style = getComputedStyle(ele);
+                return rect.left < Math.min(620, window.innerWidth * 0.48)
+                  && rect.width >= 220
+                  && rect.width <= 520
+                  && rect.height > 240
+                  && ele.scrollHeight > ele.clientHeight + 20
+                  && /(auto|scroll)/.test(style.overflowY);
+              })
+              .sort((a, b) => {
+                const ar = a.getBoundingClientRect();
+                const br = b.getBoundingClientRect();
+                return (br.height * br.width) - (ar.height * ar.width);
+              })[0];
+            if (scrollBox && scrollBox.scrollTop + scrollBox.clientHeight < scrollBox.scrollHeight - 8) {
+              scrollBox.scrollTop += Math.max(180, scrollBox.clientHeight * 0.75);
+              return {ok: false, scrolled: true};
+            }
+            return {ok: false, reason: 'no recent chat card found'};
+            """,
+            start_minute,
+            processed_json,
+        ) or {"ok": False, "reason": "open chat card script failed"}
+
+    def reset_chat_list_scroll(self) -> None:
+        self.page.run_js(
+            """
+            const visible = ele => {
+              const rect = ele.getBoundingClientRect();
+              const style = getComputedStyle(ele);
+              return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+            };
+            const boxes = Array.from(document.querySelectorAll('.im-ui-contacts-wrap, aside *, *'))
+              .filter(visible)
+              .filter(ele => {
+                const rect = ele.getBoundingClientRect();
+                const style = getComputedStyle(ele);
+                return rect.left < Math.min(520, window.innerWidth * 0.45)
+                  && rect.width >= 250
+                  && rect.width <= 360
+                  && rect.height > 240
+                  && ele.scrollHeight > ele.clientHeight + 20
+                  && /(auto|scroll)/.test(style.overflowY);
+              })
+              .sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight));
+            for (const box of boxes.slice(0, 3)) {
+              box.scrollTop = 0;
+            }
+            return boxes.length;
+            """
+        )
+        time.sleep(0.8)
+
+    def request_chat_action_in_current_chat(self, action: str, timeout: int = 14) -> dict:
+        action = "phone" if action == "phone" else "resume"
+        deadline = time.time() + timeout
+        last_result = None
+        while time.time() < deadline:
+            last_result = self.page.run_js(
+                """
+                const action = arguments[0];
+                const visible = ele => {
+                  const rect = ele.getBoundingClientRect();
+                  const style = getComputedStyle(ele);
+                  return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                };
+                const clean = value => String(value || '').replace(/\\s+/g, ' ').trim();
+                const textOf = ele => clean(ele.innerText || ele.textContent);
+                const compact = value => clean(value).replace(/\\s+/g, '');
+                const actionName = action === 'phone' ? '电话' : '简历';
+                const config = action === 'phone'
+                  ? {askText: '索要手机', availableRe: /手机号|手机|电话|查看手机|查看电话|电话已获取|手机已获取/, modalRe: /确定向对方索要(手机|电话)吗|确定.*(索要|获取).*(手机|电话)/}
+                  : {askRe: /索要简历/, availableRe: /看简历|查看简历|简历已获取/, modalRe: /确定向对方索要简历吗|确定.*索要.*简历/};
+                if (action === 'resume') config.askText = '索要简历';
+                const clickEle = ele => {
+                  ele.scrollIntoView({block: 'center', inline: 'nearest'});
+                  for (const name of ['mouseover', 'pointerover', 'pointerenter', 'mouseenter', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                    ele.dispatchEvent(new MouseEvent(name, {bubbles: true, cancelable: true, composed: true, view: window}));
+                  }
+                };
+                const dialog = Array.from(document.querySelectorAll('.ant-im-modal, .ant-lpt-modal, [role=dialog], [class*=modal]'))
+                  .filter(visible)
+                  .find(ele => config.modalRe.test(textOf(ele)) || (textOf(ele).includes('确定向对方索要') && textOf(ele).includes(actionName)));
+                const confirmScope = dialog || Array.from(document.querySelectorAll('.ant-im-popover, .ant-popover, [class*=popover], [class*=Popconfirm]'))
+                  .filter(visible)
+                  .find(ele => textOf(ele).includes('确定') && (textOf(ele).includes(actionName) || textOf(ele).includes('索要') || textOf(ele).length <= 80));
+                if (confirmScope) {
+                  const button = Array.from(confirmScope.querySelectorAll('button, [role=button], a, span, div'))
+                    .filter(visible)
+                    .filter(ele => compact(textOf(ele)) === '确定')
+                    .sort((a, b) => {
+                      const ar = a.getBoundingClientRect();
+                      const br = b.getBoundingClientRect();
+                      return (ar.width * ar.height) - (br.width * br.height);
+                    })[0];
+                  if (!button) return {ok: false, reason: `${actionName}确认按钮未找到`};
+                  clickEle(button);
+                  return {ok: false, clicked: true, confirming: true, reason: `已点击${actionName}确认`};
+                }
+                const toolbar = Array.from(document.querySelectorAll('.chatwin-action'))
+                  .filter(visible)
+                  .sort((a, b) => b.getBoundingClientRect().width - a.getBoundingClientRect().width)[0];
+                if (!toolbar) return {ok: false, status: 'not_found', reason: '底部工具栏未找到'};
+                const all = Array.from(toolbar.querySelectorAll('*')).filter(visible);
+                const isAskText = ele => compact(textOf(ele)) === config.askText;
+                const actionButtonSelector = action === 'phone' ? '.im-ui-action-button.action-phone' : '.im-ui-action-button.action-resume';
+                const actionButtons = Array.from(toolbar.querySelectorAll(actionButtonSelector)).filter(visible);
+                const actionButton = actionButtons
+                  .find(ele => textOf(ele).includes(config.askText))
+                  || actionButtons.find(ele => compact(textOf(ele)) === config.askText);
+                const pendingButton = actionButtons.find(ele => /索要中|已索要|等待/.test(textOf(ele)));
+                if (pendingButton) {
+                  return {ok: true, status: 'already_requested', message: `${actionName}已索要，当前为：${textOf(pendingButton).slice(0, 24)}`};
+                }
+                const isAvailableText = ele => {
+                  const text = textOf(ele);
+                  const compactText = compact(text);
+                  if (action === 'phone' && /^(手机号|手机|电话|查看手机|查看电话)$/.test(compactText)) return true;
+                  if (action === 'resume' && /^(看简历|查看简历)$/.test(compactText)) return true;
+                  if (action === 'phone') return false;
+                  if (action === 'resume') return false;
+                  if (!config.availableRe.test(text)) return false;
+                  return !isAskText(ele);
+                };
+                const available = all
+                  .filter(isAvailableText)
+                  .filter(ele => textOf(ele).length <= 30)
+                  .sort((a, b) => textOf(a).length - textOf(b).length)[0];
+                if (available) return {ok: true, status: 'already_available', message: `${actionName}已可查看：${textOf(available).slice(0, 24)}`};
+                const exactAction = actionButton;
+                const ask = exactAction || all
+                  .filter(isAskText)
+                  .filter(ele => textOf(ele).length <= 30)
+                  .sort((a, b) => {
+                    return textOf(a).length - textOf(b).length;
+                  })[0];
+                if (!ask) return {ok: true, status: 'not_needed', message: `底部不是${config.askText}，跳过`};
+                let button = ask;
+                for (let node = ask, depth = 0; node && depth < 6; node = node.parentElement, depth += 1) {
+                  const style = getComputedStyle(node);
+                  const tag = node.tagName;
+                  if (tag === 'BUTTON' || tag === 'A' || node.getAttribute('role') === 'button' || style.cursor === 'pointer') {
+                    button = node;
+                    break;
+                  }
+                }
+                clickEle(button);
+                return {ok: false, clicked: true, reason: `已点击${actionName}按钮，等待确认或状态变化`, clicked_text: textOf(button), clicked_class: String(button.className || '')};
+                """,
+                action,
+            )
+            if last_result and last_result.get("ok"):
+                return last_result
+            if last_result and last_result.get("confirming"):
+                time.sleep(1.0)
+                return {"status": "requested", "message": str(last_result.get("reason") or "已确认")}
+            if last_result and last_result.get("clicked"):
+                time.sleep(0.9)
+                continue
+            time.sleep(0.35)
+        return {"status": "failed", "message": str(last_result or "按钮未找到")}
+
+    @staticmethod
+    def contact_status_text(status: str) -> str:
+        return {
+            "requested": "已索要",
+            "already_available": "已可查看",
+            "not_found": "未找到会话",
+            "failed": "失败",
+            "unknown": "未知",
+        }.get(status, status or "未知")
 
     def request_resumes_after_batch(self, targets: list[dict], results: list[dict]) -> None:
         self.progress.emit("resume_request_start", f"开始进入消息页索要简历：{len(targets)} 人")
@@ -614,7 +1194,7 @@ class LiepinSearchPage:
                     status = "not_found"
                     note = opened.get("reason", "未找到消息卡片")
                 else:
-                    action = self.request_resume_in_current_chat()
+                    action = self.request_resume_in_current_chat(target)
                     status = action.get("status", "unknown")
                     note = action.get("message", "")
             except Exception as exc:
@@ -656,7 +1236,8 @@ class LiepinSearchPage:
                 const hasChatShell = body.includes('消息') && body.includes('全部职位');
                 const hasChatList = Array.from(document.querySelectorAll('*'))
                   .some(ele => visible(ele) && (ele.innerText || '').includes('求职者投递'));
-                return hasChatShell || hasChatList;
+                const hasContactCards = document.querySelectorAll('.im-ui-contact-list-item').length > 0;
+                return hasContactCards || hasChatList || (hasChatShell && body.includes('暂无'));
                 """
             )
             if ok:
@@ -672,12 +1253,20 @@ class LiepinSearchPage:
                 """
                 const target = arguments[0] || {};
                 const rawName = String(target.name || '').trim();
+                const normalizeName = value => String(value || '')
+                  .replace(/（.*?）/g, '')
+                  .replace(/\\(.*?\\)/g, '')
+                  .replace(/先生|女士|TA设置了姓名保护|（|）|\\(|\\)/g, '')
+                  .replace(/\\s+/g, '')
+                  .trim();
                 const nameTokens = Array.from(new Set([
                   rawName,
                   rawName.replace(/（.*?）/g, '').trim(),
                   rawName.replace(/\\(.*?\\)/g, '').trim(),
                   rawName.replace(/先生|女士|TA设置了姓名保护|（|）|\\(|\\)/g, '').trim(),
-                ].filter(Boolean)));
+                  normalizeName(rawName),
+                ].map(item => String(item || '').trim()).filter(Boolean)));
+                const strictNameTokens = nameTokens.filter(token => token.length >= 2 && !/TA设置|姓名保护/.test(token));
                 const chatJob = target.chat_job || {};
                 const jobTitle = String(chatJob.title || '').trim();
                 const jobTokens = jobTitle.split('-').filter(part => part && part.length >= 2);
@@ -688,11 +1277,26 @@ class LiepinSearchPage:
                   return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
                 };
                 const clean = value => String(value || '').replace(/\\s+/g, ' ').trim();
+                const compact = value => clean(value).replace(/\\s+/g, '');
+                if (!strictNameTokens.length) {
+                  return {ok: false, reason: 'candidate name is empty or protected; refuse to request resume blindly'};
+                }
+                const leftArea = ele => {
+                  const rect = ele.getBoundingClientRect();
+                  return rect.left < Math.min(620, window.innerWidth * 0.45);
+                };
+                const likelyChatCard = ele => {
+                  const rect = ele.getBoundingClientRect();
+                  const text = clean(ele.innerText || ele.textContent);
+                  if (!leftArea(ele) || rect.height < 36 || rect.height > 180 || rect.width < 180 || rect.width > 620) return false;
+                  if (!text || text.length > 320) return false;
+                  return strictNameTokens.some(token => compact(text).includes(compact(token)));
+                };
                 const scoreCard = ele => {
                   const text = clean(ele.innerText || ele.textContent);
-                  if (!text || text.length > 260) return -1;
+                  if (!likelyChatCard(ele)) return -1;
                   let score = 0;
-                  if (nameTokens.some(token => token && text.includes(token))) score += 10;
+                  if (strictNameTokens.some(token => compact(text).includes(compact(token)))) score += 100;
                   if (jobTitle && text.includes(jobTitle)) score += 8;
                   for (const token of jobTokens) {
                     if (text.includes(token)) score += 2;
@@ -705,7 +1309,7 @@ class LiepinSearchPage:
                 const cards = Array.from(document.querySelectorAll('li, [class*=item], [class*=card], [class*=session], [class*=conversation]'))
                   .filter(visible)
                   .map(ele => ({ele, score: scoreCard(ele), text: clean(ele.innerText || ele.textContent)}))
-                  .filter(item => item.score > 0)
+                  .filter(item => item.score >= 100)
                   .sort((a, b) => b.score - a.score || a.ele.getBoundingClientRect().top - b.ele.getBoundingClientRect().top);
                 const best = cards[0];
                 if (!best) {
@@ -721,7 +1325,7 @@ class LiepinSearchPage:
                     scrollBox.scrollTop += Math.max(180, scrollBox.clientHeight * 0.8);
                     return {ok: false, waiting: true, reason: 'scrolling chat list'};
                   }
-                  return {ok: false, reason: 'candidate chat card not found', tokens: nameTokens, job_tokens: jobTokens};
+                  return {ok: false, reason: 'candidate chat card not found by name', tokens: strictNameTokens, job_tokens: jobTokens};
                 }
                 best.ele.scrollIntoView({block: 'center', inline: 'nearest'});
                 for (const name of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
@@ -732,17 +1336,77 @@ class LiepinSearchPage:
                     view: window,
                   }));
                 }
-                return {ok: true, score: best.score, text: best.text.slice(0, 160)};
+                return {ok: true, score: best.score, text: best.text.slice(0, 160), tokens: strictNameTokens};
                 """,
                 target,
             )
             if last_result and last_result.get("ok"):
                 time.sleep(0.8)
-                return last_result
+                verified = self.current_chat_matches_target(target)
+                if verified.get("ok"):
+                    last_result["verified"] = verified
+                    return last_result
+                last_result = {
+                    "ok": False,
+                    "reason": "clicked chat card but active chat did not match target",
+                    "clicked": last_result,
+                    "verified": verified,
+                }
             time.sleep(0.4)
         return last_result or {"ok": False, "reason": "candidate chat card not found"}
 
-    def request_resume_in_current_chat(self, timeout: int = 12) -> dict:
+    def current_chat_matches_target(self, target: dict) -> dict:
+        return self.page.run_js(
+            """
+            const target = arguments[0] || {};
+            const rawName = String(target.name || '').trim();
+            const normalizeName = value => String(value || '')
+              .replace(/（.*?）/g, '')
+              .replace(/\\(.*?\\)/g, '')
+              .replace(/先生|女士|TA设置了姓名保护|（|）|\\(|\\)/g, '')
+              .replace(/\\s+/g, '')
+              .trim();
+            const tokens = Array.from(new Set([
+              rawName,
+              normalizeName(rawName),
+            ].map(item => String(item || '').trim()).filter(item => item.length >= 2 && !/TA设置|姓名保护/.test(item))));
+            const visible = ele => {
+              const rect = ele.getBoundingClientRect();
+              const style = getComputedStyle(ele);
+              return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+            };
+            const clean = value => String(value || '').replace(/\\s+/g, ' ').trim();
+            const compact = value => clean(value).replace(/\\s+/g, '');
+            if (!tokens.length) return {ok: false, reason: 'candidate name is empty or protected'};
+            const rightPanes = Array.from(document.querySelectorAll('[class*=chat], [class*=im], [class*=message], [class*=conversation], main, section, body'))
+              .filter(visible)
+              .filter(ele => {
+                const rect = ele.getBoundingClientRect();
+                return rect.left > Math.min(260, window.innerWidth * 0.18) && rect.width > 360 && rect.height > 240;
+              })
+              .sort((a, b) => {
+                const ar = a.getBoundingClientRect();
+                const br = b.getBoundingClientRect();
+                return (br.width * br.height) - (ar.width * ar.height);
+              });
+            const scope = rightPanes[0] || document.body;
+            const text = compact(scope.innerText || scope.textContent);
+            return {
+              ok: tokens.some(token => text.includes(compact(token))),
+              tokens,
+              sample: clean(scope.innerText || scope.textContent).slice(0, 180),
+            };
+            """,
+            target,
+        ) or {"ok": False, "reason": "chat verify failed"}
+
+    def request_resume_in_current_chat(self, target: dict, timeout: int = 12) -> dict:
+        matched = self.current_chat_matches_target(target)
+        if not matched.get("ok"):
+            return {
+                "status": "failed",
+                "message": f"当前聊天窗口不是目标候选人，停止索要简历：{matched}",
+            }
         deadline = time.time() + timeout
         last_result = None
         while time.time() < deadline:
@@ -756,7 +1420,19 @@ class LiepinSearchPage:
                 const clean = value => String(value || '').replace(/\\s+/g, ' ').trim();
                 const textOf = ele => clean(ele.innerText || ele.textContent);
                 const compactTextOf = ele => textOf(ele).replace(/\\s+/g, '');
-                const all = Array.from(document.querySelectorAll('*')).filter(visible);
+                const rightPanes = Array.from(document.querySelectorAll('[class*=chat], [class*=im], [class*=message], [class*=conversation], main, section, body'))
+                  .filter(visible)
+                  .filter(ele => {
+                    const rect = ele.getBoundingClientRect();
+                    return rect.left > Math.min(260, window.innerWidth * 0.18) && rect.width > 360 && rect.height > 240;
+                  })
+                  .sort((a, b) => {
+                    const ar = a.getBoundingClientRect();
+                    const br = b.getBoundingClientRect();
+                    return (br.width * br.height) - (ar.width * ar.height);
+                  });
+                const chatScope = rightPanes[0] || document.body;
+                const all = Array.from(chatScope.querySelectorAll('*')).filter(visible);
                 const lowerToolbar = ele => ele.getBoundingClientRect().top > window.innerHeight * 0.55;
                 const confirmResumeRequest = () => {
                   const dialogs = Array.from(document.querySelectorAll('.ant-im-modal, .ant-lpt-modal, [role=dialog], [class*=modal]'))
@@ -1463,12 +2139,23 @@ class LiepinSearchPage:
     def decide_candidate_match(self, profile: dict, filters: SearchFilters) -> dict:
         requirements = filters.match_requirements.strip() or DEFAULT_MATCH_REQUIREMENTS
 
-        decision = self.ask_deepseek_for_match(
-            profile=profile,
-            requirements=requirements,
-            api_key=filters.deepseek_api_key,
-            model=filters.deepseek_model,
-        )
+        try:
+            decision = self.ask_deepseek_for_match(
+                profile=profile,
+                requirements=requirements,
+                api_key=filters.deepseek_api_key,
+                model=filters.deepseek_model,
+            )
+        except Exception as exc:
+            decision = {
+                "match": False,
+                "score": 0,
+                "decision": "reject",
+                "reason": f"AI 判断失败，已跳过当前候选人：{exc}",
+                "next_action": "skip",
+                "ai_error": str(exc),
+            }
+            self.append_ai_match_log(profile, requirements, {"messages": []}, decision)
         profile["ai_match"] = decision
         return decision
 
@@ -1497,17 +2184,11 @@ class LiepinSearchPage:
             headers={
                 "Authorization": f"Bearer {key}",
                 "Content-Type": "application/json",
+                "Connection": "close",
             },
             method="POST",
         )
-        try:
-            with request.urlopen(req, timeout=60) as resp:
-                body = resp.read().decode("utf-8")
-        except error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"DeepSeek API 请求失败：HTTP {exc.code} {detail}") from exc
-        except error.URLError as exc:
-            raise RuntimeError(f"DeepSeek API 请求失败：{exc}") from exc
+        body = self.urlopen_with_retry(req, retries=5, timeout=60)
 
         result = json.loads(body)
         content = result["choices"][0]["message"]["content"]
@@ -1520,6 +2201,32 @@ class LiepinSearchPage:
         decision["raw_response"] = content
         self.append_ai_match_log(profile, requirements, payload, decision)
         return decision
+
+    def urlopen_with_retry(self, req: request.Request, retries: int = 5, timeout: int = 60) -> str:
+        last_error = None
+        for attempt in range(1, retries + 1):
+            try:
+                # Avoid exhausting Windows ephemeral ports during batch runs.
+                if attempt == 1:
+                    time.sleep(0.8)
+                with request.urlopen(req, timeout=timeout) as resp:
+                    return resp.read().decode("utf-8")
+            except error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")
+                if exc.code not in {408, 409, 425, 429, 500, 502, 503, 504}:
+                    raise RuntimeError(f"DeepSeek API 请求失败：HTTP {exc.code} {detail}") from exc
+                last_error = RuntimeError(f"DeepSeek API 请求失败：HTTP {exc.code} {detail}")
+            except error.URLError as exc:
+                last_error = RuntimeError(f"DeepSeek API 请求失败：{exc}")
+            except OSError as exc:
+                last_error = RuntimeError(f"DeepSeek API 请求失败：{exc}")
+
+            if attempt < retries:
+                delay = min(2 ** attempt, 20)
+                append_runtime_log(f"DeepSeek retry attempt={attempt} delay={delay}s error={last_error}")
+                time.sleep(delay)
+
+        raise last_error or RuntimeError("DeepSeek API 请求失败：unknown error")
 
     def append_ai_match_log(self, profile: dict, requirements: str, payload: dict, decision: dict) -> None:
         output_path = APP_DIR / "ai_match_logs.json"
@@ -2069,6 +2776,7 @@ class LiepinSearchPage:
 
     def click_ai_fill_button(self) -> None:
         deadline = time.time() + 15
+        last_result = None
         while time.time() < deadline:
             result = self.page.run_js(
                 """
@@ -2082,27 +2790,39 @@ class LiepinSearchPage:
                   });
                 const popover = popovers[popovers.length - 1];
                 if (!popover) return {ok: false, reason: 'popover not visible'};
-                const button = Array.from(popover.querySelectorAll('button'))
-                  .find(ele => fillTexts.includes((ele.innerText || '').trim().replace(/\\s+/g, ' ')));
-                if (!button) return {ok: false, reason: 'fill button not visible'};
+                const popoverText = (popover.innerText || popover.textContent || '').trim().replace(/\\s+/g, ' ');
+                if (popoverText.includes('正在扩展中')) {
+                  return {ok: false, waiting: true, reason: 'AI keywords still generating'};
+                }
+                const buttons = Array.from(popover.querySelectorAll('button'))
+                  .map(ele => ({
+                    ele,
+                    text: (ele.innerText || '').trim().replace(/\\s+/g, ' '),
+                    disabled: !!ele.disabled || ele.getAttribute('aria-disabled') === 'true' || ele.className.includes('disabled'),
+                  }));
+                const button = (buttons.find(item => item.text === '填入复合关键词')
+                  || buttons.find(item => fillTexts.includes(item.text))
+                  || {});
+                if (!button.ele) return {ok: false, reason: 'fill button not visible'};
+                if (button.disabled) return {ok: false, waiting: true, reason: 'fill button disabled'};
                 for (const name of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
-                  button.dispatchEvent(new MouseEvent(name, {
+                  button.ele.dispatchEvent(new MouseEvent(name, {
                     bubbles: true,
                     cancelable: true,
                     composed: true,
                     view: window,
                   }));
                 }
-                return {ok: true};
+                return {ok: true, text: button.text};
                 """,
                 "|".join(AI_FILL_TEXTS),
             )
+            last_result = result
             if result and result.get("ok"):
-                time.sleep(0.8)
-                if not self.has_visible_ai_popover():
-                    return
+                time.sleep(1.0)
+                return
             time.sleep(0.5)
-        raise RuntimeError("AI fill popover did not close after clicking fill.")
+        raise RuntimeError(f"AI fill popover did not close after clicking fill: {last_result}")
 
     def select_city(self, row_title: str, city: str) -> None:
         self.progress.emit("city_select", f"正在选择{row_title}：{city}")

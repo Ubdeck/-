@@ -46,6 +46,11 @@ DEFAULT_REQUIREMENTS = DEFAULT_MATCH_REQUIREMENTS
 DEFAULT_BROWSER_PORT = 9224
 SEARCH_URL = "https://lpt.liepin.com/search"
 STARTUP_LOG_PATH = APP_DIR / "startup.log"
+LOCAL_DEBUG_ENDPOINTS = (
+    ("127.0.0.1", "127.0.0.1"),
+    ("localhost", "localhost"),
+    ("[::1]", "::1"),
+)
 BROWSER_CANDIDATES = [
     r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
     r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
@@ -67,11 +72,13 @@ def startup_log(message: str) -> None:
 
 
 def is_local_port_open(port: int) -> bool:
-    try:
-        with socket.create_connection(("127.0.0.1", port), timeout=0.5):
-            return True
-    except OSError:
-        return False
+    for _http_host, socket_host in LOCAL_DEBUG_ENDPOINTS:
+        try:
+            with socket.create_connection((socket_host, port), timeout=0.5):
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def find_edge_executable() -> Path | None:
@@ -112,8 +119,8 @@ def browser_launch_env() -> dict:
         upper_key = key.upper()
         if upper_key.startswith("PYINSTALLER_") or upper_key in {"_MEIPASS2", "PYTHONHOME", "PYTHONPATH"}:
             env.pop(key, None)
-    env["NO_PROXY"] = "127.0.0.1,localhost"
-    env["no_proxy"] = "127.0.0.1,localhost"
+    env["NO_PROXY"] = "127.0.0.1,localhost,::1,[::1]"
+    env["no_proxy"] = "127.0.0.1,localhost,::1,[::1]"
     return env
 
 
@@ -156,14 +163,33 @@ def request_local(path: str, timeout: float = 1.0) -> str:
         return response.read().decode("utf-8")
 
 
+def debug_browser_http_url(port: int, path: str) -> str | None:
+    for http_host, _socket_host in LOCAL_DEBUG_ENDPOINTS:
+        url = f"http://{http_host}:{port}{path}"
+        try:
+            request_local(url, timeout=1.0)
+            return url
+        except Exception:
+            continue
+    return None
+
+
 def debug_browser_ready(port: int = DEFAULT_BROWSER_PORT, timeout: float = 1.0) -> bool:
+    errors = []
+    for http_host, _socket_host in LOCAL_DEBUG_ENDPOINTS:
+        url = f"http://{http_host}:{port}/json/version"
+        try:
+            request_local(url, timeout=timeout)
+            startup_log(f"debug browser http ready on {http_host}:{port}")
+            return True
+        except Exception as exc:
+            errors.append(f"{http_host}: {exc}")
     try:
-        request_local(f"http://127.0.0.1:{port}/json/version", timeout=timeout)
-        return True
-    except Exception as exc:
         if is_local_port_open(port):
-            startup_log(f"debug browser tcp open but http check failed on {port}: {exc}")
-        return False
+            startup_log(f"debug browser tcp open but http check failed on {port}: {'; '.join(errors)}")
+    except Exception:
+        pass
+    return False
 
 
 def debug_browser_ready_stable(port: int = DEFAULT_BROWSER_PORT, checks: int = 2, interval: float = 0.3, timeout: float = 0.8) -> bool:
@@ -201,11 +227,12 @@ def kill_profile_browser_processes(profile_dir: Path) -> None:
 
 def browser_debug_diag(port: int) -> str:
     parts = []
-    try:
-        with socket.create_connection(("127.0.0.1", port), timeout=0.5):
-            parts.append(f"tcp:{port}=open")
-    except OSError as exc:
-        parts.append(f"tcp:{port}=closed:{exc}")
+    for http_host, socket_host in LOCAL_DEBUG_ENDPOINTS:
+        try:
+            with socket.create_connection((socket_host, port), timeout=0.5):
+                parts.append(f"tcp:{http_host}:{port}=open")
+        except OSError as exc:
+            parts.append(f"tcp:{http_host}:{port}=closed:{exc}")
     for proc in psutil.process_iter(["pid", "name", "cmdline"]):
         try:
             name = (proc.info.get("name") or "").lower()
@@ -421,6 +448,8 @@ def default_filter_config() -> dict:
         "deepseek_model": "deepseek-chat",
         "match_requirements": DEFAULT_REQUIREMENTS,
         "auto_communicate": True,
+        "request_resume_after_communicate": True,
+        "request_phone_after_communicate": False,
         "candidate_limit": 4,
     }
 
@@ -546,7 +575,16 @@ class AppState:
             task["updated_at"] = now
             self.data["active_task_id"] = task["id"]
             defaults = self.data.get("defaults", {}).copy()
-            for key in ("deepseek_api_key", "deepseek_model", "match_requirements", "auto_communicate", "candidate_limit", "port"):
+            for key in (
+                "deepseek_api_key",
+                "deepseek_model",
+                "match_requirements",
+                "auto_communicate",
+                "request_resume_after_communicate",
+                "request_phone_after_communicate",
+                "candidate_limit",
+                "port",
+            ):
                 if key in task["config"]:
                     defaults[key] = task["config"][key]
             self.data["defaults"] = defaults
@@ -723,7 +761,14 @@ def normalize_config(config: dict) -> dict:
             if text and text not in cleaned:
                 cleaned.append(text)
         base[key] = cleaned[:5]
-    for key in ("use_keywords_ai_words", "use_job_ai_words", "use_company_ai_words", "auto_communicate"):
+    for key in (
+        "use_keywords_ai_words",
+        "use_job_ai_words",
+        "use_company_ai_words",
+        "auto_communicate",
+        "request_resume_after_communicate",
+        "request_phone_after_communicate",
+    ):
         base[key] = bool(base.get(key))
     return base
 
@@ -736,6 +781,8 @@ def build_filters(config: dict) -> tuple[SearchFilters, int]:
         deepseek_api_key=str(cfg.get("deepseek_api_key") or "").strip(),
         deepseek_model=str(cfg.get("deepseek_model") or "deepseek-chat").strip(),
         auto_communicate=bool(cfg.get("auto_communicate")),
+        request_resume_after_communicate=bool(cfg.get("request_resume_after_communicate")),
+        request_phone_after_communicate=bool(cfg.get("request_phone_after_communicate")),
         candidate_limit=int(cfg.get("candidate_limit") or 1),
         keywords=str(cfg.get("keywords") or "").strip(),
         job_name=str(cfg.get("job_name") or "").strip(),
@@ -1239,6 +1286,8 @@ INDEX_HTML = r"""<!doctype html>
           <div><label>模型</label><input id="deepseek_model" /></div>
           <div><label>处理人数</label><input id="candidate_limit" type="number" min="1" /></div>
           <div class="field full"><label class="check"><input id="auto_communicate" type="checkbox" />AI 判断通过后自动沟通；如果页面是“继续沟通”则跳过</label></div>
+          <div class="field full"><label class="check"><input id="request_resume_after_communicate" type="checkbox" />沟通成功后，到消息列表按本轮开始时间索要简历</label></div>
+          <div class="field full"><label class="check"><input id="request_phone_after_communicate" type="checkbox" />沟通成功后，到消息列表按本轮开始时间索要电话</label></div>
           <div class="field full">
             <label>人话匹配要求</label>
             <textarea id="match_requirements" placeholder="例如：要有销售经验，最好做过医疗行业，成都优先，薪资别太离谱。留空则使用默认通用要求。"></textarea>
@@ -1300,7 +1349,8 @@ const fieldIds = [
   "experience", "education", "recruitment_type", "active_status", "job_status",
   "job_hop_frequency", "age_requirement", "gender_requirement", "language_requirement",
   "graduation_year", "deepseek_api_key", "deepseek_model", "candidate_limit", "match_requirements",
-  "use_keywords_ai_words", "use_job_ai_words", "use_company_ai_words", "auto_communicate"
+  "use_keywords_ai_words", "use_job_ai_words", "use_company_ai_words", "auto_communicate",
+  "request_resume_after_communicate", "request_phone_after_communicate"
 ];
 
 function optionHtml(values, selected = "") {
@@ -1588,6 +1638,7 @@ async function refreshJobs() {
 function renderResults() {
   const mapComm = {done:"已确认", already_communicated:"已沟通", failed:"失败"};
   const mapResume = {requested:"已索要", already_available:"已可看", not_found:"未找到会话", failed:"索要失败"};
+  const mapPhone = {requested:"电话已索要", already_available:"电话可查看", not_found:"未找到会话", failed:"电话失败"};
   document.getElementById("results").innerHTML = (state.results || []).map(item => `
     <tr>
       <td>${escapeHtml(item.index || "")}</td>
@@ -1595,7 +1646,7 @@ function renderResults() {
       <td>${escapeHtml([item.job_position, item.location || item.job_cities].filter(Boolean).join(" / "))}</td>
       <td><span class="tag ${item.match ? "ok" : "bad"}">${item.match ? "匹配" : "不匹配"}</span></td>
       <td>${escapeHtml(item.score || 0)}</td>
-      <td title="${escapeHtml([item.communicate_note, item.resume_request_note].filter(Boolean).join('；'))}">${escapeHtml([mapComm[item.communicate_status] || item.communicate_status || "", mapResume[item.resume_request_status] || ""].filter(Boolean).join(" / "))}</td>
+      <td title="${escapeHtml([item.communicate_note, item.phone_request_note, item.resume_request_note].filter(Boolean).join('；'))}">${escapeHtml([mapComm[item.communicate_status] || item.communicate_status || "", mapPhone[item.phone_request_status] || "", mapResume[item.resume_request_status] || ""].filter(Boolean).join(" / "))}</td>
       <td>${escapeHtml(item.reason || "")}</td>
     </tr>
   `).join("");
