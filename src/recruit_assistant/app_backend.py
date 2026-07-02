@@ -421,7 +421,6 @@ OPTION_GROUPS = {
     "active_status": ["", "不限", "今天活跃", "3天内活跃", "7天内活跃", "30天内活跃", "最近三个月活跃", "最近半年活跃"],
     "job_status": ["", "不限", "离职，正在找工作", "在职，急寻新工作", "在职，看看新机会", "在职，暂无跳槽打算"],
     "job_hop_frequency": ["", "不限", "近5年不超过3段", "近3年不超过2段", "近2段均不低于2年"],
-    "age_requirement": ["", "不限", "20-25岁", "25-30岁", "30-35岁", "35-40岁", "40岁以上"],
     "gender_requirement": ["", "不限", "男", "女"],
     "language_requirement": ["", "不限", "英语", "日语", "粤语"],
     "graduation_year": ["", "不限", "2025年毕业", "2026年毕业", "2027年毕业", "2028年毕业", "2029年毕业", "2030年毕业"],
@@ -497,7 +496,8 @@ def default_filter_config() -> dict:
         "active_status": "",
         "job_status": "",
         "job_hop_frequency": "",
-        "age_requirement": "",
+        "age_min": "",
+        "age_max": "",
         "gender_requirement": "",
         "language_requirement": "",
         "graduation_year": "",
@@ -1057,7 +1057,8 @@ def build_filters(config: dict) -> tuple[SearchFilters, int]:
         active_status=str(cfg.get("active_status") or "").strip(),
         job_status=str(cfg.get("job_status") or "").strip(),
         job_hop_frequency=str(cfg.get("job_hop_frequency") or "").strip(),
-        age_requirement=str(cfg.get("age_requirement") or "").strip(),
+        age_min=str(cfg.get("age_min") or "").strip(),
+        age_max=str(cfg.get("age_max") or "").strip(),
         gender_requirement=str(cfg.get("gender_requirement") or "").strip(),
         language_requirement=str(cfg.get("language_requirement") or "").strip(),
         graduation_year=str(cfg.get("graduation_year") or "").strip(),
@@ -1273,6 +1274,8 @@ INDEX_HTML = r"""<!doctype html>
     textarea { min-height: 126px; resize: vertical; line-height: 1.55; }
     .fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
     .field.full { grid-column: 1 / -1; }
+    .range-inputs { display: grid; grid-template-columns: 1fr auto 1fr; gap: 8px; align-items: center; }
+    .range-inputs span { color: var(--muted); font-weight: 700; }
     .checks { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; min-height: 40px; }
     .check { display: inline-flex; align-items: center; gap: 7px; color: #374151; font-size: 13px; }
     .check input { width: 16px; height: 16px; min-height: 0; }
@@ -1586,7 +1589,14 @@ INDEX_HTML = r"""<!doctype html>
           <div><label>活跃状态</label><select id="active_status"></select></div>
           <div><label>求职状态</label><select id="job_status"></select></div>
           <div><label>跳槽频率</label><select id="job_hop_frequency"></select></div>
-          <div><label>年龄要求</label><select id="age_requirement"></select></div>
+          <div>
+            <label>年龄要求</label>
+            <div class="range-inputs">
+              <input id="age_min" type="number" min="16" max="80" placeholder="最小" />
+              <span>-</span>
+              <input id="age_max" type="number" min="16" max="80" placeholder="最大" />
+            </div>
+          </div>
           <div><label>性别要求</label><select id="gender_requirement"></select></div>
           <div><label>语言要求</label><select id="language_requirement"></select></div>
           <div><label>毕业年份</label><select id="graduation_year"></select></div>
@@ -1676,7 +1686,7 @@ const fieldIds = [
   "platform",
   "port", "keywords", "job_name", "company_name", "current_city", "expected_city",
   "experience", "recruitment_type", "active_status", "job_status",
-  "job_hop_frequency", "age_requirement", "gender_requirement", "language_requirement",
+  "job_hop_frequency", "age_min", "age_max", "gender_requirement", "language_requirement",
   "graduation_year", "deepseek_api_key", "deepseek_model", "candidate_limit", "match_requirements",
   "use_keywords_ai_words", "use_job_ai_words", "use_company_ai_words", "auto_communicate",
   "request_resume_after_communicate", "request_phone_after_communicate",

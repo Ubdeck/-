@@ -210,7 +210,8 @@ class SearchFilters:
     active_status: str = ""
     job_status: str = ""
     job_hop_frequency: str = ""
-    age_requirement: str = ""
+    age_min: str = ""
+    age_max: str = ""
     gender_requirement: str = ""
     language_requirement: str = ""
     graduation_year: str = ""
@@ -470,7 +471,6 @@ class LiepinSearchPage:
             (ACTIVE_STATUS_TITLE, filters.active_status),
             (JOB_STATUS_TITLE, filters.job_status),
             (JOB_HOP_FREQUENCY_TITLE, filters.job_hop_frequency),
-            (AGE_REQUIREMENT_TITLE, filters.age_requirement),
             (GENDER_REQUIREMENT_TITLE, filters.gender_requirement),
             (LANGUAGE_REQUIREMENT_TITLE, filters.language_requirement),
             (GRADUATION_YEAR_TITLE, filters.graduation_year),
@@ -489,6 +489,9 @@ class LiepinSearchPage:
             self.check_stopped()
             if value:
                 self.select_dropdown_option(title, value)
+        if filters.age_min or filters.age_max:
+            self.check_stopped()
+            self.select_custom_age_range(filters.age_min, filters.age_max)
         for title, value in industry_filters:
             self.check_stopped()
             if value:
@@ -4096,6 +4099,91 @@ class LiepinSearchPage:
             time.sleep(0.2)
         raise RuntimeError(f"Could not click dropdown option: {option_text}, {last_result}")
 
+    def select_custom_age_range(self, age_min: str, age_max: str) -> None:
+        min_value = str(age_min or "").strip()
+        max_value = str(age_max or "").strip()
+        if not min_value and not max_value:
+            return
+        self.select_dropdown_option(AGE_REQUIREMENT_TITLE, "自定义")
+        deadline = time.time() + 8
+        last_result = None
+        while time.time() < deadline:
+            last_result = self.page.run_js(
+                """
+                const minValue = arguments[0];
+                const maxValue = arguments[1];
+                const visible = ele => {
+                  const rect = ele.getBoundingClientRect();
+                  const style = getComputedStyle(ele);
+                  return rect.width > 0
+                    && rect.height > 0
+                    && style.display !== 'none'
+                    && style.visibility !== 'hidden';
+                };
+                const compact = value => String(value || '').replace(/\\s+/g, '');
+                const setValue = (input, value) => {
+                  if (!input || value === '') return;
+                  input.focus();
+                  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+                  setter.call(input, value);
+                  input.dispatchEvent(new Event('input', {bubbles: true}));
+                  input.dispatchEvent(new Event('change', {bubbles: true}));
+                  input.blur();
+                };
+                const containers = Array.from(document.querySelectorAll('div, span'))
+                  .filter(ele => visible(ele) && compact(ele.innerText || ele.textContent).includes('自定义'))
+                  .map(ele => ele.closest('[class*=wrap], [class*=Box], [class*=group], [class*=content]') || ele)
+                  .filter(Boolean);
+                const unique = [];
+                for (const item of containers) {
+                  if (!unique.includes(item)) unique.push(item);
+                }
+                const candidates = unique.map(container => {
+                  const rect = container.getBoundingClientRect();
+                  const inputs = Array.from(container.querySelectorAll('input'))
+                    .filter(input => visible(input) && !input.disabled && input.type !== 'hidden')
+                    .sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left);
+                  return {container, inputs, area: rect.width * rect.height};
+                })
+                  .filter(item => item.inputs.length >= 2)
+                  .sort((a, b) => a.area - b.area);
+                const target = candidates[0];
+                if (!target) return {ok: false, reason: 'age custom inputs not found'};
+                setValue(target.inputs[0], minValue);
+                setValue(target.inputs[1], maxValue);
+                let confirmScope = target.container;
+                let confirm = null;
+                for (let depth = 0; confirmScope && depth < 6 && !confirm; depth += 1, confirmScope = confirmScope.parentElement) {
+                  confirm = Array.from(confirmScope.querySelectorAll('button, span, div, a'))
+                    .filter(ele => visible(ele) && compact(ele.innerText || ele.textContent) === '确认')
+                    .sort((a, b) => {
+                      const ar = a.getBoundingClientRect();
+                      const br = b.getBoundingClientRect();
+                      return (ar.width * ar.height) - (br.width * br.height);
+                    })[0] || null;
+                }
+                if (confirm) {
+                  confirm.scrollIntoView({block: 'center', inline: 'nearest'});
+                  for (const name of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                    confirm.dispatchEvent(new MouseEvent(name, {
+                      bubbles: true,
+                      cancelable: true,
+                      composed: true,
+                      view: window,
+                    }));
+                  }
+                }
+                return {ok: true, values: target.inputs.slice(0, 2).map(input => input.value), confirmed: !!confirm};
+                """,
+                min_value,
+                max_value,
+            )
+            if last_result and last_result.get("ok"):
+                time.sleep(0.3)
+                return
+            time.sleep(0.2)
+        raise RuntimeError(f"Could not fill custom age range: {last_result}")
+
     def close_open_dropdown(self) -> None:
         self.page.run_js(
             """
@@ -4169,7 +4257,8 @@ def main() -> None:
     parser.add_argument("--active-status", default="")
     parser.add_argument("--job-status", default="")
     parser.add_argument("--job-hop-frequency", default="")
-    parser.add_argument("--age-requirement", default="")
+    parser.add_argument("--age-min", default="")
+    parser.add_argument("--age-max", default="")
     parser.add_argument("--gender-requirement", default="")
     parser.add_argument("--language-requirement", default="")
     parser.add_argument("--graduation-year", default="")
@@ -4208,7 +4297,8 @@ def main() -> None:
             active_status=args.active_status.strip(),
             job_status=args.job_status.strip(),
             job_hop_frequency=args.job_hop_frequency.strip(),
-            age_requirement=args.age_requirement.strip(),
+            age_min=args.age_min.strip(),
+            age_max=args.age_max.strip(),
             gender_requirement=args.gender_requirement.strip(),
             language_requirement=args.language_requirement.strip(),
             graduation_year=args.graduation_year.strip(),
