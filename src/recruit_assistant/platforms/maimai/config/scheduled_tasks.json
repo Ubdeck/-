@@ -1,0 +1,24 @@
+[
+  {
+    "id": "9abf2e54147b48a5aaf4fbcf91c1f084",
+    "time_text": "09:21",
+    "created_at": "2026-06-10 09:33:07",
+    "settings": {
+      "keyword": "c开发",
+      "keyword_mode": "所有",
+      "city": "杭州",
+      "education": "本科及以上",
+      "education_extra": "只看统招本科",
+      "work_years": "1-3年",
+      "graduation_year": "无",
+      "companies": "绿盟,亚信科技,新华三",
+      "gender": "无",
+      "page_limit": 1,
+      "ai_requirement_text": "无",
+      "greeting": "你好，我对您的简历非常感兴趣，方便聊一聊嘛",
+      "actual_send": true,
+      "schedule_enabled": false,
+      "schedule_time": "09:21"
+    }
+  }
+]

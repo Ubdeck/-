@@ -1,0 +1,1 @@
+"""Recruitment assistant automation package."""

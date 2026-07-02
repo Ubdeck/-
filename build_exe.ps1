@@ -50,23 +50,45 @@ if (-not $venvOk) {
 & $python -m pip install --upgrade pip -i https://pypi.tuna.tsinghua.edu.cn/simple
 & $python -m pip install -r requirements.txt pyinstaller -i https://pypi.tuna.tsinghua.edu.cn/simple
 
-# Main deliverable: single exe for copying to another computer.
-& $python -m PyInstaller --noconfirm --clean --onefile --name LiepinAutomation --collect-all DrissionPage --hidden-import DrissionPage --hidden-import psutil run.py
+$appName = -join ([char[]](0x62DB, 0x8058, 0x8F6F, 0x4EF6, 0x52A9, 0x624B))
+$portableName = "${appName}Portable"
+$maimaiRoot = Join-Path $root "src\recruit_assistant\platforms\maimai"
+if (-not (Test-Path $maimaiRoot)) {
+    throw "Bundled Maimai platform module not found: $maimaiRoot"
+}
+$maimaiSrcData = "$(Join-Path $maimaiRoot 'src');src"
+$maimaiLegacyData = "$(Join-Path $maimaiRoot 'legacy');legacy"
+$maimaiConfigData = "$(Join-Path $maimaiRoot 'config');config"
 
-$singleExe = Join-Path $root "dist\LiepinAutomation.exe"
+# Main deliverable: single exe for copying to another computer.
+& $python -m PyInstaller --noconfirm --clean --windowed --onefile --name RecruitAssistant --paths src --add-data $maimaiSrcData --add-data $maimaiLegacyData --add-data $maimaiConfigData --collect-all DrissionPage --collect-all webview --hidden-import DrissionPage --hidden-import psutil --hidden-import webview --hidden-import clr_loader --hidden-import pythonnet run.py
+
+$builtSingleExe = Join-Path $root "dist\RecruitAssistant.exe"
+$singleExe = Join-Path $root "dist\$appName.exe"
+if (Test-Path $singleExe) {
+    Remove-Item -LiteralPath $singleExe -Force
+}
+Move-Item -LiteralPath $builtSingleExe -Destination $singleExe
 if (-not (Test-Path $singleExe)) {
     throw "Single exe build failed: $singleExe"
 }
 
 # Fallback deliverable: onedir portable package, useful if onefile is blocked by antivirus.
-& $python -m PyInstaller --noconfirm --clean --onedir --name LiepinAutomationPortable --collect-all DrissionPage --hidden-import DrissionPage --hidden-import psutil run.py
+& $python -m PyInstaller --noconfirm --clean --windowed --onedir --name RecruitAssistantPortable --paths src --add-data $maimaiSrcData --add-data $maimaiLegacyData --add-data $maimaiConfigData --collect-all DrissionPage --collect-all webview --hidden-import DrissionPage --hidden-import psutil --hidden-import webview --hidden-import clr_loader --hidden-import pythonnet run.py
 
-$launcher = Join-Path $root "dist\LiepinAutomationPortable\run_portable.bat"
+$builtPortableDir = Join-Path $root "dist\RecruitAssistantPortable"
+$portableDir = Join-Path $root "dist\$portableName"
+if (Test-Path $portableDir) {
+    Remove-Item -LiteralPath $portableDir -Recurse -Force
+}
+Move-Item -LiteralPath $builtPortableDir -Destination $portableDir
+
+$launcher = Join-Path $portableDir "run_portable.bat"
 @"
 @echo off
 setlocal
 cd /d "%~dp0"
-start "" ".\LiepinAutomationPortable.exe"
+start "" ".\RecruitAssistantPortable.exe"
 "@ | Set-Content -Path $launcher -Encoding ASCII
 
 Write-Host "Build complete: $singleExe"

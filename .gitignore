@@ -9,6 +9,10 @@ dist/
 *.err
 edge_profile_*/
 runtime/
+backups/
+脉脉自动化/
+_legacy_maimai_auto/
+*.docx
 
 liepin_web_config.json
 liepin_jobs.json
