@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import contextlib
@@ -34,9 +34,9 @@ def workspace_root() -> Path:
 
 
 def maimai_root() -> Path:
-    bundled_root = Path(__file__).resolve().parent / "maimai"
-    if bundled_root.exists():
-        return bundled_root
+    local_root = Path(__file__).resolve().parent
+    if (local_root / "src" / "maimai_auto").exists():
+        return local_root
     if hasattr(sys, "_MEIPASS"):
         bundle_root = Path(sys._MEIPASS)
         if (bundle_root / "src" / "maimai_auto").exists():
@@ -297,24 +297,36 @@ def run_pipeline_subprocess(config: dict, callback: Logger = None, timeout: int 
     result_path = temp_dir / f"result-{stamp}.json"
     config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    cmd = [
-        sys.executable,
-        "-m",
-        "recruit_assistant.platforms.maimai_worker",
-        str(config_path),
-        str(result_path),
-    ]
+    if getattr(sys, "frozen", False):
+        cmd = [
+            sys.executable,
+            "--maimai-worker",
+            str(config_path),
+            str(result_path),
+        ]
+    else:
+        cmd = [
+            sys.executable,
+            "-m",
+            "recruit_assistant.platforms.maimai_worker",
+            str(config_path),
+            str(result_path),
+        ]
     env = os.environ.copy()
-    package_src_dir = str(Path(__file__).resolve().parents[1])
+    package_src_dir = str(Path(__file__).resolve().parents[3])
     maimai_dir = str(maimai_root())
     env["PYTHONPATH"] = os.pathsep.join(
         path for path in (package_src_dir, maimai_dir, env.get("PYTHONPATH", "")) if path
     )
 
+    worker_cwd = workspace_root()
+    if not worker_cwd.exists():
+        worker_cwd = Path(__file__).resolve().parents[3]
+
     _log(callback, f"Maimai worker started, timeout {timeout}s.")
     process = subprocess.Popen(
         cmd,
-        cwd=str(Path(__file__).resolve().parents[2]),
+        cwd=str(worker_cwd),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -379,4 +391,3 @@ def run_pipeline_subprocess(config: dict, callback: Logger = None, timeout: int 
     if process.returncode:
         raise RuntimeError(f"Maimai worker exited with code {process.returncode}.")
     raise RuntimeError("Maimai worker did not return a result file.")
-

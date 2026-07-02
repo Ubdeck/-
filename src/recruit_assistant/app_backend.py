@@ -368,7 +368,7 @@ def ensure_edge_debugging(port: int = DEFAULT_BROWSER_PORT, default_url: str | N
         return
     reset_windows_dll_dir()
     runtime_dir = browser_runtime_dir()
-    profile_dir = runtime_dir / f"browser-profile-{port}-{os.getpid()}"
+    profile_dir = runtime_dir / f"browser-profile-{port}"
     profile_dir.mkdir(parents=True, exist_ok=True)
     startup_log(f"ensure_debug_browser runtime_dir={runtime_dir} profile_dir={profile_dir}")
     kill_profile_browser_processes(profile_dir)
