@@ -26,7 +26,7 @@ from urllib.parse import urlparse
 import psutil
 
 from .platforms.liepin import DEFAULT_MATCH_REQUIREMENTS, LiepinSearchPage, SearchFilters, connect_chromium_page
-from .platforms import maimai_bridge
+from .platforms.maimai import bridge as maimai_bridge
 
 try:
     import winreg
@@ -554,8 +554,6 @@ class AppState:
     def __init__(self) -> None:
         self.lock = threading.RLock()
         self.run_lock = threading.Lock()
-        self.open_lock = threading.Lock()
-        self.open_seq = 0
         self.logs: list[dict] = []
         self.results: list[dict] = []
         self.running = False
@@ -726,22 +724,6 @@ class AppState:
     def open_platform_async(self, platform: str, port: int) -> None:
         threading.Thread(target=self.open_platform, args=(platform, port), daemon=True).start()
 
-    def open_platform(self, platform: str, port: int, seq: int) -> None:
-        platform = "maimai" if str(platform or "").lower() == "maimai" else "liepin"
-        target_url = maimai_bridge.MAIMAI_URL if platform == "maimai" else SEARCH_URL
-        platform_name = "脉脉" if platform == "maimai" else "猎聘"
-        if self.running:
-            self.add_log(f"当前有任务正在运行，暂不切换到{platform_name}首页。")
-            return
-        try:
-            self.add_log(f"正在切换当前页面到{platform_name}：{target_url}")
-            if not ensure_debug_browser_for_work(port):
-                raise RuntimeError(f"浏览器调试端口 {port} 未就绪。")
-            page = connect_platform_page(target_url, port)
-            self.add_log(f"已打开{platform_name}初始页面：{page.url}")
-        except Exception as exc:
-            self.add_log(f"打开{platform_name}初始页面失败：{exc}")
-
     def refresh_jobs(self, port: int) -> None:
         if not self.run_lock.acquire(blocking=False):
             self.add_log("当前有任务正在运行，暂不刷新职位。")
@@ -897,38 +879,6 @@ class AppState:
             running_task = self.running_task
         self.add_log(f"正在停止当前任务：{running_task or '未命名任务'}")
         return True
-
-    def open_platform(self, platform: str, port: int, seq: int) -> None:
-        platform = "maimai" if str(platform or "").lower() == "maimai" else "liepin"
-        target_url = maimai_bridge.MAIMAI_URL if platform == "maimai" else SEARCH_URL
-        platform_name = "脉脉" if platform == "maimai" else "猎聘"
-        if self.running:
-            self.add_log(f"当前有任务正在运行，暂不切换到{platform_name}首页。")
-            return
-        if not self.open_lock.acquire(blocking=False):
-            self.add_log(f"浏览器正在切换平台，已忽略本次{platform_name}打开请求。")
-            return
-        try:
-            with self.lock:
-                if seq != self.open_seq:
-                    return
-            self.add_log(f"正在打开{platform_name}初始页面：{target_url}")
-            if not ensure_debug_browser_for_work(port):
-                raise RuntimeError(f"浏览器调试端口 {port} 未就绪。")
-            with self.lock:
-                if seq != self.open_seq:
-                    return
-            page = connect_platform_page(target_url, port)
-            with self.lock:
-                if seq != self.open_seq:
-                    return
-            self.add_log(f"已打开{platform_name}初始页面：{page.url}")
-        except Exception as exc:
-            with self.lock:
-                if seq == self.open_seq:
-                    self.add_log(f"打开{platform_name}初始页面失败：{exc}")
-        finally:
-            self.open_lock.release()
 
     def open_platform(self, platform: str, port: int) -> None:
         platform = "maimai" if str(platform or "").lower() == "maimai" else "liepin"

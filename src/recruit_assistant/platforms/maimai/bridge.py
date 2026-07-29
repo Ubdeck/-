@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import contextlib
-import importlib
 import json
 import os
 import queue
@@ -15,61 +14,27 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Callable
 
+from . import browser, contacts, matching, paths, phone_exchange
+from .automation import candidates, communication, resume, search
+from .settings import (
+    EDUCATION_EXTRA_OPTIONS,
+    EDUCATION_OPTIONS,
+    GENDER_OPTIONS,
+    GRADUATION_YEAR_OPTIONS,
+    KEYWORD_MODE_OPTIONS,
+    WORK_YEAR_OPTIONS,
+    SearchSettings,
+)
+
 
 Logger = Callable[[str], None] | None
 MAIMAI_URL = "https://maimai.cn/ent/v41/recruit/talents?pid=&tab=1"
 
 
 def workspace_root() -> Path:
-    if hasattr(sys, "_MEIPASS"):
-        bundle_root = Path(sys._MEIPASS)
-        if (bundle_root / "src" / "maimai_auto").exists():
-            return bundle_root
     if getattr(sys, "frozen", False):
-        exe_dir = Path(sys.executable).resolve().parent
-        if exe_dir.name.lower() == "dist" or exe_dir.parent.name.lower() == "dist":
-            return exe_dir.parents[1]
-        return exe_dir.parent
-    return Path(__file__).resolve().parents[3]
-
-
-def maimai_root() -> Path:
-    local_root = Path(__file__).resolve().parent
-    if (local_root / "src" / "maimai_auto").exists():
-        return local_root
-    if hasattr(sys, "_MEIPASS"):
-        bundle_root = Path(sys._MEIPASS)
-        if (bundle_root / "src" / "maimai_auto").exists():
-            return bundle_root
-    maimai_dir_name = "".join(chr(code) for code in (0x8109, 0x8109, 0x81EA, 0x52A8, 0x5316))
-    candidates = [
-        workspace_root() / maimai_dir_name,
-        Path.cwd().resolve().parent / maimai_dir_name,
-        Path.cwd().resolve() / maimai_dir_name,
-    ]
-    if getattr(sys, "frozen", False):
-        exe_dir = Path(sys.executable).resolve().parent
-        candidates.extend(
-            [
-                exe_dir.parent / maimai_dir_name,
-                exe_dir.parent.parent / maimai_dir_name,
-                exe_dir / maimai_dir_name,
-            ]
-        )
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    return candidates[0]
-
-
-def ensure_maimai_path() -> None:
-    root = maimai_root()
-    if not root.exists():
-        raise RuntimeError(f"Maimai project directory not found: {root}")
-    for path in (root, root / "src"):
-        text = str(path)
-        if text not in sys.path:
-            sys.path.insert(0, text)
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parents[4]
 
 
 class CallbackWriter:
@@ -108,35 +73,13 @@ def _run_with_capture(callback: Logger, func, *args, **kwargs):
     return result
 
 
-def load_modules() -> dict:
-    ensure_maimai_path()
-    return {
-        "config": importlib.import_module("src.maimai_auto.config"),
-        "matching": importlib.import_module("src.maimai_auto.matching"),
-        "contacted": importlib.import_module("src.maimai_auto.contacted_candidates"),
-        "legacy": importlib.import_module("src.maimai_auto.legacy"),
-    }
-
-
-def configure_maimai_port(modules: dict, port: int) -> None:
+def configure_maimai_port(port: int) -> None:
     port = int(port)
-    modules["config"].DEFAULT_DEBUG_PORT = port if hasattr(modules["config"], "DEFAULT_DEBUG_PORT") else port
-    try:
-        importlib.import_module("src.maimai_auto.paths").DEFAULT_DEBUG_PORT = port
-        importlib.import_module("src.maimai_auto.browser_connect").DEFAULT_DEBUG_PORT = port
-        importlib.import_module("src.maimai_auto.message_monitor").DEFAULT_DEBUG_PORT = port
-    except Exception:
-        pass
-    for loader_name in ("load_search_module", "load_resume_extract_batch_module", "load_chat_flow_module"):
-        try:
-            modules["legacy"].__dict__[loader_name].cache_clear()
-        except Exception:
-            pass
+    for module in (paths, browser, phone_exchange, search, resume):
+        module.DEFAULT_DEBUG_PORT = port
 
 
 def config_to_settings(config: dict):
-    modules = load_modules()
-    SearchSettings = modules["config"].SearchSettings
     settings = SearchSettings.from_dict(
         {
             "keyword": config.get("maimai_keyword", ""),
@@ -160,46 +103,34 @@ def config_to_settings(config: dict):
 
 
 def maimai_options() -> dict:
-    modules = load_modules()
-    cfg = modules["config"]
     return {
-        "work_years": list(cfg.WORK_YEAR_OPTIONS),
-        "graduation_year": list(cfg.GRADUATION_YEAR_OPTIONS),
-        "education": list(cfg.EDUCATION_OPTIONS),
-        "education_extra": list(cfg.EDUCATION_EXTRA_OPTIONS),
-        "gender": list(cfg.GENDER_OPTIONS),
-        "keyword_mode": list(cfg.KEYWORD_MODE_OPTIONS),
+        "work_years": list(WORK_YEAR_OPTIONS),
+        "graduation_year": list(GRADUATION_YEAR_OPTIONS),
+        "education": list(EDUCATION_OPTIONS),
+        "education_extra": list(EDUCATION_EXTRA_OPTIONS),
+        "gender": list(GENDER_OPTIONS),
+        "keyword_mode": list(KEYWORD_MODE_OPTIONS),
     }
 
 
 def load_matches() -> dict:
-    modules = load_modules()
-    return modules["matching"].load_match_results()
+    return matching.load_match_results()
 
 
 def load_contacted() -> dict:
-    modules = load_modules()
-    return modules["contacted"].load_contacted_candidates()
+    return contacts.load_contacted_candidates()
 
 
 def run_pipeline(config: dict, callback: Logger = None) -> dict:
-    modules = load_modules()
-    configure_maimai_port(modules, int(config.get("maimai_port") or config.get("port") or 9225))
+    configure_maimai_port(int(config.get("maimai_port") or config.get("port") or 9225))
     settings = config_to_settings(config)
-    legacy = modules["legacy"]
-    matching = modules["matching"]
-    contacted = modules["contacted"]
-
-    search_module = legacy.load_search_module()
-    batch_module = legacy.load_resume_extract_batch_module()
-    chat_module = legacy.load_chat_flow_module()
 
     matching.reset_match_results()
-    contacted.reset_contacted_candidates()
+    contacts.reset_contacted_candidates()
 
     _log(callback, "Start Maimai candidate search.")
-    _run_with_capture(callback, search_module.run_candidate_search, settings.to_search_config())
-    page = batch_module.connect_page()
+    _run_with_capture(callback, search.run_candidate_search, settings.to_search_config())
+    page = candidates.connect_page()
 
     last_match_result = {"matched_candidates": [], "rejected_candidates": [], "summary": ""}
     target_pages = max(1, int(settings.page_limit))
@@ -215,7 +146,7 @@ def run_pipeline(config: dict, callback: Logger = None) -> dict:
             try:
                 page_candidates = _run_with_capture(
                     callback,
-                    batch_module.extract_current_page,
+                    candidates.extract_current_page,
                     page_number,
                     candidate_limit_arg,
                     page,
@@ -239,14 +170,21 @@ def run_pipeline(config: dict, callback: Logger = None) -> dict:
         _log(callback, f"Maimai page {page_number}: AI match complete, matched {len(matched)} candidates.")
 
         if matched:
-            _run_with_capture(callback, chat_module.run_chat_flow_test, settings.greeting, settings.actual_send, page_number, page)
+            _run_with_capture(
+                callback,
+                communication.run_chat_flow_test,
+                settings.greeting,
+                settings.actual_send,
+                page_number,
+                page,
+            )
         else:
             _log(callback, f"Maimai page {page_number}: no matched candidates, skip chat.")
 
         processed_pages += 1
         if processed_pages >= target_pages:
             break
-        if not _run_with_capture(callback, batch_module.goto_next_page, page):
+        if not _run_with_capture(callback, candidates.goto_next_page, page):
             raise RuntimeError(f"Maimai page {page_number}: failed to go to next page.")
 
     if not settings.actual_send:
@@ -254,7 +192,7 @@ def run_pipeline(config: dict, callback: Logger = None) -> dict:
     else:
         _log(callback, "Maimai configured pages completed; pipeline finished without message monitoring.")
 
-    contacted_payload = contacted.load_contacted_candidates()
+    contacted_payload = contacts.load_contacted_candidates()
     return {
         "platform": "maimai",
         "processed_pages": processed_pages,
@@ -286,15 +224,14 @@ def run_pipeline_subprocess(config: dict, callback: Logger = None, timeout: int 
         cmd = [
             sys.executable,
             "-m",
-            "recruit_assistant.platforms.maimai_worker",
+            "recruit_assistant.platforms.maimai.worker",
             str(config_path),
             str(result_path),
         ]
     env = os.environ.copy()
     package_src_dir = str(Path(__file__).resolve().parents[3])
-    maimai_dir = str(maimai_root())
     env["PYTHONPATH"] = os.pathsep.join(
-        path for path in (package_src_dir, maimai_dir, env.get("PYTHONPATH", "")) if path
+        path for path in (package_src_dir, env.get("PYTHONPATH", "")) if path
     )
 
     worker_cwd = workspace_root()

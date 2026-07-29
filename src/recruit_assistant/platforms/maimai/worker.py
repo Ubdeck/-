@@ -17,7 +17,7 @@ else:
 
 def main() -> int:
     if len(sys.argv) != 3:
-        print("Usage: python -m recruit_assistant.platforms.maimai_worker <config.json> <result.json>", flush=True)
+        print("Usage: python -m recruit_assistant.platforms.maimai.worker <config.json> <result.json>", flush=True)
         return 2
 
     config_path = Path(sys.argv[1])

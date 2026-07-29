@@ -13,6 +13,7 @@ backups/
 脉脉自动化/
 _legacy_maimai_auto/
 *.docx
+!docs/*.docx
 
 liepin_web_config.json
 liepin_jobs.json
