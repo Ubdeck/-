@@ -158,7 +158,7 @@ def click_first_detail_list_card_js(page: ChromiumPage) -> bool:
     const card = cards[0];
     if (!card) return false;
     card.scrollIntoView({block: 'center', inline: 'nearest'});
-    for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+    for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup']) {
       card.dispatchEvent(new MouseEvent(type, {
         bubbles: true,
         cancelable: true,
@@ -209,7 +209,6 @@ def click_search_result_js(page: ChromiumPage, index: int = 0) -> bool:
       target.dispatchEvent(new MouseEvent('mousedown', {...base, buttons: 1}));
       target.dispatchEvent(window.PointerEvent ? new PointerEvent('pointerup', {...base, buttons: 0}) : new MouseEvent('pointerup', {...base, buttons: 0}));
       target.dispatchEvent(new MouseEvent('mouseup', {...base, buttons: 0}));
-      target.dispatchEvent(new MouseEvent('click', {...base, buttons: 0}));
       if (typeof target.click === 'function') target.click();
     };
     const seen = new Set();

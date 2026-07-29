@@ -208,7 +208,10 @@ def seed_targets_from_matches(state: dict) -> dict:
             "contact_status": item.get("contact_status", base.get("contact_status", "")),
             "contacted_at": item.get("contacted_at", base.get("contacted_at", "")),
             "thread_found": bool(base.get("thread_found", False)),
-            "phone_exchange_status": normalize_text(base.get("phone_exchange_status", "")) or "pending",
+            "phone_exchange_status": normalize_text(
+                item.get("phone_exchange_status", base.get("phone_exchange_status", ""))
+            )
+            or "pending",
             "last_session_time": base.get("last_session_time", ""),
             "last_session_preview": base.get("last_session_preview", ""),
             "last_incoming_preview": base.get("last_incoming_preview", ""),
@@ -225,6 +228,24 @@ def seed_targets_from_matches(state: dict) -> dict:
     return state
 
 
+def wait_message_frame(page, timeout: float = 10.0):
+    deadline = time.time() + max(0.5, float(timeout))
+    last_error = "iframe not ready"
+    while time.time() < deadline:
+        try:
+            frame = page.get_frame("tag:iframe")
+            if not frame:
+                raise RuntimeError("message iframe missing")
+            body = normalize_text(frame.run_js("return document.body ? document.body.innerText : '';"))
+            if TEXT_RECRUIT_MESSAGES in body:
+                return frame
+            last_error = body[:120] or "message body empty"
+        except Exception as exc:
+            last_error = str(exc)
+        time.sleep(0.5)
+    raise RuntimeError(f"message iframe not ready: {last_error}")
+
+
 def connect_message_frame():
     page = connect_chromium_page(search_url=MESSAGE_URL, port=DEFAULT_DEBUG_PORT)
     try:
@@ -235,21 +256,7 @@ def connect_message_frame():
         page.get(MESSAGE_URL)
         time.sleep(2)
 
-    deadline = time.time() + 10
-    last_error = "iframe not ready"
-    while time.time() < deadline:
-        try:
-            frame = page.get_frame("tag:iframe")
-            if not frame:
-                raise RuntimeError("message iframe missing")
-            body = normalize_text(frame.run_js("return document.body ? document.body.innerText : '';"))
-            if TEXT_RECRUIT_MESSAGES in body:
-                return page, frame
-            last_error = body[:120] or "message body empty"
-        except Exception as exc:
-            last_error = str(exc)
-        time.sleep(0.5)
-    raise RuntimeError(f"message iframe not ready: {last_error}")
+    return page, wait_message_frame(page)
 
 
 def get_rendered_sessions(frame) -> list[dict]:
@@ -309,7 +316,7 @@ def click_rendered_session(frame, rendered_index: int) -> bool:
     const row = rows[index];
     if (!row) return false;
     const target = row.querySelector('.message-detail') || row;
-    ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(type => {
+    ['pointerdown', 'mousedown', 'pointerup', 'mouseup'].forEach(type => {
       target.dispatchEvent(new MouseEvent(type, {
         bubbles: true,
         cancelable: true,
@@ -416,7 +423,7 @@ def click_exchange_phone_if_present(frame) -> dict:
     const norm = (s) => (s || '').replace(/\\u00a0/g, ' ').replace(/\\s+/g, ' ').trim();
     const button = [...document.querySelectorAll('.tool.normal')].find(el => norm(el.innerText) === arguments[0]);
     if (!button) return false;
-    ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(type => {
+    ['pointerdown', 'mousedown', 'pointerup', 'mouseup'].forEach(type => {
       button.dispatchEvent(new MouseEvent(type, {
         bubbles: true,
         cancelable: true,
@@ -431,7 +438,11 @@ def click_exchange_phone_if_present(frame) -> dict:
     time.sleep(1.5)
     after_tools = get_tool_texts(frame)
     body_text = get_body_text(frame)
-    if clicked and (TEXT_REQUESTING in after_tools or TEXT_PHONE_REQUEST_SENT in body_text[-1000:]):
+    if clicked and (
+        TEXT_EXCHANGE_PHONE not in after_tools
+        or TEXT_REQUESTING in after_tools
+        or TEXT_PHONE_REQUEST_SENT in body_text[-1000:]
+    ):
         return {
             "status": "requested",
             "before_tools": before_tools,
@@ -444,6 +455,37 @@ def click_exchange_phone_if_present(frame) -> dict:
         "after_tools": after_tools,
         "body_excerpt": body_text[-800:],
     }
+
+
+def exchange_phone_for_candidate(page, candidate_name: str, timeout: float = 10.0) -> dict:
+    expected_name = normalize_text(candidate_name)
+    frame = wait_message_frame(page, timeout=timeout)
+    identity = get_open_dialogue_identity(frame)
+
+    if identity["name"] != expected_name and wait_dialogue_switched(frame, expected_name, timeout=4.0):
+        identity = get_open_dialogue_identity(frame)
+
+    if identity["name"] != expected_name:
+        session = find_and_open_session(frame, expected_name)
+        if not session:
+            return {
+                "status": "thread_not_found",
+                "expected_name": expected_name,
+                "opened_name": identity["name"],
+            }
+        identity = get_open_dialogue_identity(frame)
+
+    if identity["name"] != expected_name:
+        return {
+            "status": "dialogue_mismatch",
+            "expected_name": expected_name,
+            "opened_name": identity["name"],
+        }
+
+    result = click_exchange_phone_if_present(frame)
+    result["expected_name"] = expected_name
+    result["opened_name"] = identity["name"]
+    return result
 
 
 def extract_dialogue_messages(frame, limit: int = 12) -> list[str]:
@@ -704,44 +746,3 @@ def snapshot_visible_sessions(frame, limit: int = 10) -> list[dict]:
             }
         )
     return sessions
-
-
-def run_message_followup(
-    poll_seconds: float = DEFAULT_POLL_SECONDS,
-    exchange_only: bool = False,
-    max_targets: int | None = None,
-    monitor_once: bool = False,
-) -> dict:
-    state = seed_targets_from_matches(load_state())
-    save_state(state)
-    append_log(f"loaded targets: {len(state.get('targets', []))}")
-    if not state.get("targets"):
-        append_log("no contacted candidates available for follow-up")
-        return state
-
-    page, frame = connect_message_frame()
-    append_log(f"connected message page: {page.url}")
-
-    process_phone_exchange_for_targets(frame, state, limit=max_targets)
-    if exchange_only:
-        append_log("exchange_only mode finished")
-        return state
-
-    if monitor_once:
-        return monitor_replies_once(frame, state)
-
-    monitor_replies(frame, state, poll_seconds=poll_seconds)
-    return state
-
-
-def run_app2(
-    poll_seconds: float = DEFAULT_POLL_SECONDS,
-    exchange_only: bool = False,
-    max_targets: int | None = None,
-) -> None:
-    run_message_followup(
-        poll_seconds=poll_seconds,
-        exchange_only=exchange_only,
-        max_targets=max_targets,
-        monitor_once=False,
-    )

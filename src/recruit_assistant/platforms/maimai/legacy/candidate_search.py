@@ -46,7 +46,7 @@ def dom_click(page: ChromiumPage, js_selector: str, *args) -> bool:
     const target = (new Function('args', selector))(args);
     if (!target) return false;
     target.scrollIntoView && target.scrollIntoView({block: 'center', inline: 'nearest'});
-    for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+    for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup']) {
       target.dispatchEvent(new MouseEvent(type, {
         bubbles: true,
         cancelable: true,
@@ -78,6 +78,53 @@ def get_filter_titles(page: ChromiumPage) -> List[str]:
       .filter(Boolean);
     """
     return page.run_js(js) or []
+
+
+def close_candidate_detail_drawer(page: ChromiumPage) -> bool:
+    js = """
+    const isVisible = el => {
+      if (!el) return false;
+      const style = getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+    };
+    const drawer = [...document.querySelectorAll('.ant-drawer-content[role="dialog"], .ant-drawer-content')]
+      .find(isVisible);
+    if (!drawer) return false;
+    const closeUse = [...drawer.querySelectorAll('use')].find(el => {
+      const href = el.getAttribute('href') || el.getAttribute('xlink:href') || '';
+      return href === '#icon-close';
+    });
+    const target = closeUse && closeUse.closest('button, span[role="img"], .mui-btn');
+    if (!target) return false;
+    ['pointerdown', 'mousedown', 'pointerup', 'mouseup'].forEach(type => {
+      target.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, composed: true, view: window }));
+    });
+    if (typeof target.click === 'function') target.click();
+    return true;
+    """
+    try:
+        closed = bool(page.run_js(js))
+    except Exception:
+        return False
+    if closed:
+        time.sleep(0.5)
+    return closed
+
+
+def wait_search_filter_panel(page: ChromiumPage, timeout: float = 8.0) -> bool:
+    end_at = time.time() + timeout
+    while time.time() < end_at:
+        try:
+            titles = get_filter_titles(page)
+            if any(title.startswith("城市地区") for title in titles) and any(
+                title.startswith("学历要求") for title in titles
+            ):
+                return True
+        except Exception:
+            pass
+        time.sleep(0.25)
+    return False
 
 
 def find_filter_anchor(page: ChromiumPage, label: str):
@@ -125,11 +172,26 @@ def click_filter_by_anchor(page: ChromiumPage, label: str) -> bool:
 
 
 def clear_all_filters(page: ChromiumPage) -> None:
-    clear_btn = wait_text(page, "娓呯┖", timeout=2)
+    clear_btn = wait_text(page, "清空", timeout=2)
     if clear_btn:
         safe_click(clear_btn)
         time.sleep(0.8)
         clear_selection(page)
+
+
+def verify_applied_filters(page: ChromiumPage, filters: Dict[str, Union[str, Sequence[str], None]]) -> None:
+    titles = get_filter_titles(page)
+    for label, raw_value in filters.items():
+        if not raw_value:
+            continue
+        values = [raw_value] if isinstance(raw_value, str) else [item for item in raw_value if item]
+        values = [str(item).strip() for item in values if str(item).strip() and str(item).strip() not in {"无", "不限"}]
+        if not values:
+            continue
+        title = next((item for item in titles if item.startswith(label)), "")
+        missing = [value for value in values if value not in title]
+        if missing:
+            raise RuntimeError(f"筛选条件未生效：{label} -> {missing}；当前显示：{title or '未找到'}")
 
 
 def menu_is_open(page: ChromiumPage, markers: Sequence[str]) -> bool:
@@ -1088,10 +1150,19 @@ def run_candidate_search(config: Dict) -> ChromiumPage:
         except Exception:
             pass
     time.sleep(2)
+    close_candidate_detail_drawer(page)
+    if not wait_search_filter_panel(page):
+        print("[WARN] 筛选区未就绪，刷新后重试", flush=True)
+        page.refresh()
+        time.sleep(2)
+        close_candidate_detail_drawer(page)
+    if not wait_search_filter_panel(page):
+        raise RuntimeError("人才搜索筛选区未加载完成")
     print("[INFO] 脉脉搜索：清空筛选", flush=True)
     clear_all_filters(page)
     print("[INFO] 脉脉搜索：应用筛选条件", flush=True)
     apply_filters(page, config.get("filters", {}))
+    verify_applied_filters(page, config.get("filters", {}))
     print("[INFO] 脉脉搜索：输入关键词", flush=True)
     input_keyword(page, config.get("keyword", ""))
     print("[INFO] 脉脉搜索：设置关键词模式", flush=True)

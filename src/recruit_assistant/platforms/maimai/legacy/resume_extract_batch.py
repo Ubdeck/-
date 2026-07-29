@@ -113,8 +113,13 @@ def wait_candidate_list_ready(page, minimum: int = 8, timeout: float = 6.0) -> b
     stable_rounds = 0
     last_signature = ""
     while time.time() < end_at:
-        reset_candidate_list_to_top(page)
-        candidates = get_current_page_candidates(page)
+        try:
+            reset_candidate_list_to_top(page)
+            candidates = get_current_page_candidates(page)
+        except Exception:
+            stable_rounds = 0
+            time.sleep(0.4)
+            continue
         count = len(candidates)
         names = [item.get("name", "") for item in candidates[:8]]
         signature = "|".join(names) + f"#{count}"
@@ -136,7 +141,10 @@ def load_current_page_candidates(page, minimum: int = 8, retries: int = 3):
     best = []
     for attempt in range(1, max(1, retries) + 1):
         wait_candidate_list_ready(page, minimum=minimum, timeout=6.0 + attempt)
-        candidates = get_current_page_candidates(page)
+        try:
+            candidates = get_current_page_candidates(page)
+        except Exception:
+            candidates = []
         if len(candidates) > len(best):
             best = candidates
         if len(candidates) >= minimum:
@@ -190,7 +198,7 @@ def js_click_card(page, index: int) -> bool:
     const card = cards[index];
     if (!card) return false;
     card.scrollIntoView({block: 'center', inline: 'nearest'});
-    for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+    for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup']) {
       card.dispatchEvent(new MouseEvent(type, {
         bubbles: true,
         cancelable: true,
@@ -218,7 +226,7 @@ def click_candidate_card(page, index: int) -> str:
     return point["name"]
 
 
-def wait_resume_switch(page, expected_name: str, previous_name: str, timeout: float = 2.5) -> bool:
+def wait_resume_switch(page, expected_name: str, previous_name: str, timeout: float = 4.5) -> bool:
     end_at = time.time() + timeout
     while time.time() < end_at:
         current_name = get_detail_header_name(page)
@@ -226,16 +234,16 @@ def wait_resume_switch(page, expected_name: str, previous_name: str, timeout: fl
             return True
         if expected_name and expected_name in current_name:
             return True
-        if previous_name and current_name and current_name != previous_name:
-            return True
         time.sleep(0.1)
     return False
 
 
 def ensure_candidate_switched(page, index: int, expected_name: str, previous_name: str, retries: int = 3) -> bool:
     for attempt in range(1, retries + 1):
+        if wait_resume_switch(page, expected_name, previous_name, timeout=0.4):
+            return True
         click_candidate_card(page, index)
-        if wait_resume_switch(page, expected_name, previous_name, timeout=2.5):
+        if wait_resume_switch(page, expected_name, previous_name, timeout=4.5):
             time.sleep(0.15)
             return True
         print(f"[WARN] 第 {attempt}/{retries} 次切换候选人失败：{expected_name}")
@@ -313,7 +321,7 @@ def click_next_page(page) -> bool:
         const target = nodes[0];
         if (!target) return false;
         target.scrollIntoView({block: 'center', inline: 'nearest'});
-        ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(type => {
+        ['pointerdown', 'mousedown', 'pointerup', 'mouseup'].forEach(type => {
           target.dispatchEvent(new MouseEvent(type, {
             bubbles: true,
             cancelable: true,
@@ -335,11 +343,48 @@ def click_next_page(page) -> bool:
 
 def wait_next_page_loaded(page, previous_marker: str, timeout: float = 8.0) -> bool:
     end_at = time.time() + timeout
+    stable_marker = ""
+    stable_since = None
     while time.time() < end_at:
-        current_marker = get_page_marker(page)
+        try:
+            current_marker = get_page_marker(page)
+        except Exception:
+            current_marker = ""
         if current_marker and current_marker != previous_marker:
-            return True
+            if current_marker != stable_marker:
+                stable_marker = current_marker
+                stable_since = time.time()
+            elif stable_since and time.time() - stable_since >= 1.5:
+                return True
+        else:
+            stable_marker = ""
+            stable_since = None
         time.sleep(0.2)
+    return False
+
+
+def wait_page_context_stable(page, timeout: float = 8.0, stable_seconds: float = 2.5) -> bool:
+    end_at = time.time() + timeout
+    stable_since = None
+    stable_marker = ""
+    while time.time() < end_at:
+        try:
+            ready = page.run_js("return document.readyState === 'complete';")
+            marker = get_page_marker(page)
+        except Exception:
+            ready = False
+            marker = ""
+
+        if ready and marker:
+            if marker != stable_marker:
+                stable_marker = marker
+                stable_since = time.time()
+            elif stable_since and time.time() - stable_since >= stable_seconds:
+                return True
+        else:
+            stable_marker = ""
+            stable_since = None
+        time.sleep(0.25)
     return False
 
 
@@ -353,6 +398,19 @@ def ensure_detail_page(page) -> bool:
     if not is_candidate_detail_open(page):
         print("[WARN] 当前不在候选人详情页，无法处理左侧列表")
         return False
+    stable_name = ""
+    stable_since = None
+    deadline = time.time() + 3.0
+    while time.time() < deadline:
+        current_name = get_detail_header_name(page)
+        if current_name and current_name == stable_name:
+            stable_since = stable_since or time.time()
+            if time.time() - stable_since >= 0.8:
+                return True
+        else:
+            stable_name = current_name
+            stable_since = time.time() if current_name else None
+        time.sleep(0.15)
     return True
 
 
@@ -376,13 +434,15 @@ def extract_current_page(page_number: int = 1, max_candidates: int | None = None
 
         if not (candidate.get("selected") and previous_name == expected_name):
             if not ensure_candidate_switched(page, index, expected_name, previous_name):
-                raise RuntimeError(f"第 {page_number} 页第 {local_order} 个候选人切换失败：{expected_name}")
+                print(f"[WARN] 跳过切换失败的候选人：第 {page_number} 页第 {local_order} 个 - {expected_name}")
+                continue
 
         current_name = get_detail_header_name(page)
         if expected_name and current_name and expected_name not in current_name and current_name != expected_name:
-            raise RuntimeError(
+            print(
                 f"第 {page_number} 页第 {local_order} 个候选人详情未切换成功：期望 {expected_name}，实际 {current_name}"
             )
+            continue
 
         data = extract_resume_key_info(page) or {}
         data["list_index"] = local_order
@@ -416,9 +476,13 @@ def goto_next_page(page=None) -> bool:
         reset_candidate_list_to_top(page)
         candidates = load_current_page_candidates(page)
         count = len(candidates)
-        if count > 0:
+        if count > 0 and wait_page_context_stable(page):
             print(f"[INFO] 翻页成功，当前页已识别 {count} 个候选人。")
             return True
+        if count > 0:
+            print(f"[WARN] 翻页后页面上下文仍不稳定，第 {attempt}/3 次重试。")
+            time.sleep(0.8)
+            continue
         print(f"[WARN] 翻页后候选人列表为空，第 {attempt}/3 次重试。")
         time.sleep(0.5)
     return False

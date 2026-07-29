@@ -30,11 +30,9 @@ from .config import (
     save_settings,
     upsert_schedule,
 )
-from .contacted_candidates import load_contacted_candidates
-from .message_monitor import load_state as load_message_followup_state
 from .matching import load_match_results
 from .paths import DEFAULT_DEBUG_PORT, DEFAULT_MAIMAI_URL, runtime_root
-from .workflows import is_message_followup_running, run_full_pipeline
+from .workflows import run_full_pipeline
 
 
 HOST = "127.0.0.1"
@@ -48,7 +46,6 @@ STATE = {
     "scheduled_for": "",
     "schedule_enabled": False,
     "schedule_count": 0,
-    "message_followup_running": False,
 }
 STATE_LOCK = threading.Lock()
 SCHEDULE_LOCK = threading.RLock()
@@ -126,61 +123,7 @@ def set_status(message: str):
 
 def get_state() -> dict:
     with STATE_LOCK:
-        snapshot = dict(STATE)
-    snapshot["message_followup_running"] = is_message_followup_running()
-    return snapshot
-
-
-def followup_target_key(item: dict) -> tuple[str, int, int]:
-    return (
-        str(item.get("name", "") or "").strip(),
-        int(item.get("page_number", 0) or 0),
-        int(item.get("page_list_index", item.get("list_index", 0)) or 0),
-    )
-
-
-def load_followup_payload() -> dict:
-    contacted = load_contacted_candidates()
-    state = load_message_followup_state()
-    contacted_candidates = contacted.get("contacted_candidates", [])
-    state_targets = state.get("targets", [])
-    state_lookup = {
-        followup_target_key(item): dict(item)
-        for item in state_targets
-        if str(item.get("name", "") or "").strip()
-    }
-
-    targets = []
-    for item in contacted_candidates:
-        key = followup_target_key(item)
-        merged = dict(item)
-        merged.update(state_lookup.get(key, {}))
-        merged["name"] = str(merged.get("name", "") or "").strip()
-        merged["page_number"] = int(merged.get("page_number", 0) or 0)
-        merged["page_list_index"] = int(merged.get("page_list_index", merged.get("list_index", 0)) or 0)
-        merged["list_index"] = int(merged.get("list_index", merged["page_list_index"]) or merged["page_list_index"])
-        merged["phone_exchange_status"] = merged.get("phone_exchange_status", "") or "pending"
-        targets.append(merged)
-
-    recent_replies = [
-        {
-            "name": item.get("name", ""),
-            "reply_detected_at": item.get("reply_detected_at", ""),
-            "last_messages": list(item.get("last_messages", []) or []),
-            "last_session_preview": item.get("last_session_preview", ""),
-        }
-        for item in targets
-        if item.get("reply_detected_at")
-    ]
-    recent_replies.sort(key=lambda item: item.get("reply_detected_at", ""), reverse=True)
-    return {
-        "running": is_message_followup_running(),
-        "contacted_count": len(contacted_candidates),
-        "contacted_candidates": contacted_candidates,
-        "targets": targets,
-        "recent_replies": recent_replies[:10],
-        "updated_at": state.get("updated_at", "") or contacted.get("updated_at", ""),
-    }
+        return dict(STATE)
 
 
 def escape(value) -> str:
@@ -272,23 +215,16 @@ def run_worker(settings: SearchSettings, source: str = "手动启动") -> bool:
     try:
         run_full_pipeline(settings, set_status)
         with STATE_LOCK:
-            STATE["status"] = (
-                "本轮沟通已完成，消息跟进已启动。"
-                if is_message_followup_running()
-                else "已完成，本轮流程执行成功。"
-            )
-            STATE["message_followup_running"] = is_message_followup_running()
+            STATE["status"] = "已完成，本轮流程执行成功。"
         return True
     except Exception as exc:
         with STATE_LOCK:
             STATE["error"] = str(exc)
             STATE["status"] = "运行失败"
-            STATE["message_followup_running"] = is_message_followup_running()
         return False
     finally:
         with STATE_LOCK:
             STATE["running"] = False
-            STATE["message_followup_running"] = is_message_followup_running()
 
 
 def make_schedule_entry(settings: SearchSettings) -> ScheduleEntry:
@@ -630,15 +566,6 @@ def html_page(settings: SearchSettings) -> str:
       <div class="results" id="matchList"><div class="empty">本轮还没有 AI 通过名单。</div></div>
     </section>
 
-    <section class="card list-card">
-      <div class="list-head">
-        <div>
-          <div class="list-title">消息跟进</div>
-          <div class="list-sub" id="followupSummary">消息监听尚未启动</div>
-        </div>
-      </div>
-      <div class="results" id="followupList"><div class="empty">还没有交换手机或回复监听数据。</div></div>
-    </section>
   </main>
 
   <script>
@@ -651,8 +578,6 @@ def html_page(settings: SearchSettings) -> str:
     const matchList = document.getElementById('matchList');
     const scheduleSummary = document.getElementById('scheduleSummary');
     const scheduleList = document.getElementById('scheduleList');
-    const followupSummary = document.getElementById('followupSummary');
-    const followupList = document.getElementById('followupList');
 
     function renderMatches(items) {{
       if (!items.length) {{
@@ -706,37 +631,6 @@ def html_page(settings: SearchSettings) -> str:
       `).join('');
     }}
 
-    function renderFollowup(data) {{
-      const runningText = data.running ? '运行中' : '未运行';
-      const contactedCount = data.contacted_count || 0;
-      const updatedAt = data.updated_at || '暂无';
-      followupSummary.textContent = `消息监听：${{runningText}} | 已记录沟通人：${{contactedCount}} | 最近更新：${{updatedAt}}`;
-
-      const targets = data.targets || [];
-      if (!targets.length) {{
-        followupList.innerHTML = '<div class="empty">还没有交换手机或回复监听数据。</div>';
-        return;
-      }}
-
-      followupList.innerHTML = targets.map((item) => {{
-        const exchange = item.phone_exchange_status || 'pending';
-        const preview = item.last_session_preview || '暂无会话预览';
-        const replyAt = item.reply_detected_at || '暂无回复';
-        const messages = (item.last_messages || []).slice(-2).join(' / ') || '暂无抓取消息';
-        return `
-          <article class="result-item">
-            <div class="result-top">
-              <div class="result-name">${{item.name || '未命名候选人'}}</div>
-              <div class="score">换电话：${{exchange}}</div>
-            </div>
-            <div class="meta">最近预览：${{preview}}</div>
-            <div class="meta">最近回复时间：${{replyAt}}</div>
-            <div class="reason">最近消息：${{messages}}</div>
-          </article>
-        `;
-      }}).join('');
-    }}
-
     async function refreshStatus() {{
       try {{
         const res = await fetch('/status');
@@ -744,8 +638,7 @@ def html_page(settings: SearchSettings) -> str:
         startBtn.disabled = !!data.running;
         startBtn.textContent = data.running ? '运行中...' : '一键启动';
         const scheduleText = data.schedule_count ? ` | 定时任务: ${{data.schedule_count}} 个 | 最近: ${{data.scheduled_for}}` : '';
-        const followupText = data.message_followup_running ? ' | 消息监听运行中' : '';
-        statusBox.textContent = data.error ? ('失败: ' + data.error) : ((data.status || '准备就绪') + scheduleText + followupText);
+        statusBox.textContent = data.error ? ('失败: ' + data.error) : ((data.status || '准备就绪') + scheduleText);
       }} catch (error) {{
         statusBox.textContent = '状态获取失败：' + error.message;
       }}
@@ -774,17 +667,6 @@ def html_page(settings: SearchSettings) -> str:
       }}
     }}
 
-    async function refreshFollowup() {{
-      try {{
-        const res = await fetch('/api/followup');
-        const data = await res.json();
-        renderFollowup(data);
-      }} catch (error) {{
-        followupSummary.textContent = '消息跟进读取失败';
-        followupList.innerHTML = '<div class="empty">读取消息跟进失败：' + error.message + '</div>';
-      }}
-    }}
-
     async function postForm(path) {{
       try {{
         const body = new URLSearchParams(new FormData(form));
@@ -797,7 +679,6 @@ def html_page(settings: SearchSettings) -> str:
       await refreshStatus();
       await refreshMatches();
       await refreshSchedules();
-      await refreshFollowup();
     }}
 
     async function deleteSchedule(id) {{
@@ -810,7 +691,6 @@ def html_page(settings: SearchSettings) -> str:
       }}
       await refreshStatus();
       await refreshSchedules();
-      await refreshFollowup();
     }}
     window.deleteSchedule = deleteSchedule;
 
@@ -835,11 +715,9 @@ def html_page(settings: SearchSettings) -> str:
     refreshStatus();
     refreshMatches();
     refreshSchedules();
-    refreshFollowup();
     setInterval(refreshStatus, 1200);
     setInterval(refreshMatches, 2500);
     setInterval(refreshSchedules, 3500);
-    setInterval(refreshFollowup, 2500);
   </script>
 </body>
 </html>"""
@@ -866,9 +744,6 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path.startswith("/api/schedules"):
             self.send_text(json.dumps(schedule_payload(), ensure_ascii=False), "application/json; charset=utf-8")
-            return
-        if self.path.startswith("/api/followup"):
-            self.send_text(json.dumps(load_followup_payload(), ensure_ascii=False), "application/json; charset=utf-8")
             return
         self.send_text(html_page(load_settings()))
 

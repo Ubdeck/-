@@ -530,7 +530,6 @@ def default_filter_config() -> dict:
         "maimai_ai_requirement_text": "",
         "maimai_greeting": "你好，我对你的简历很感兴趣，方便沟通一下吗？",
         "maimai_actual_send": False,
-        "maimai_followup_after_send": True,
         "maimai_deepseek_base_url": "https://api.deepseek.com",
     }
 
@@ -690,7 +689,6 @@ class AppState:
                 "maimai_keyword_mode",
                 "maimai_deepseek_base_url",
                 "maimai_actual_send",
-                "maimai_followup_after_send",
             ):
                 if key in task["config"]:
                     defaults[key] = task["config"][key]
@@ -1028,7 +1026,6 @@ def normalize_config(config: dict) -> dict:
         "request_resume_after_communicate",
         "request_phone_after_communicate",
         "maimai_actual_send",
-        "maimai_followup_after_send",
     ):
         base[key] = bool(base.get(key))
     return base
@@ -1563,7 +1560,6 @@ INDEX_HTML = r"""<!doctype html>
           <div><label>每页候选人数</label><input id="maimai_candidate_limit" type="number" min="0" placeholder="0 为不限制" /></div>
           <div class="field full"><label>问候语</label><input id="maimai_greeting" /></div>
           <div class="field full"><label class="check"><input id="maimai_actual_send" type="checkbox" />实际发送沟通消息</label></div>
-          <div class="field full"><label class="check"><input id="maimai_followup_after_send" type="checkbox" />发送后启动消息跟进、交换手机号并监听回复</label></div>
         </div>
       </section>
 
@@ -1693,7 +1689,7 @@ const fieldIds = [
   "maimai_keyword", "maimai_port", "maimai_keyword_mode", "maimai_city", "maimai_education", "maimai_education_extra",
   "maimai_work_years", "maimai_graduation_year", "maimai_companies", "maimai_gender",
   "maimai_page_limit", "maimai_candidate_limit", "maimai_ai_requirement_text", "maimai_greeting", "maimai_actual_send",
-  "maimai_followup_after_send", "maimai_deepseek_base_url"
+  "maimai_deepseek_base_url"
 ];
 
 function optionHtml(values, selected = "") {

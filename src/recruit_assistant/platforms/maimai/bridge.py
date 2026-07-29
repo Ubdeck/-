@@ -113,7 +113,6 @@ def load_modules() -> dict:
     return {
         "config": importlib.import_module("src.maimai_auto.config"),
         "matching": importlib.import_module("src.maimai_auto.matching"),
-        "message_monitor": importlib.import_module("src.maimai_auto.message_monitor"),
         "contacted": importlib.import_module("src.maimai_auto.contacted_candidates"),
         "legacy": importlib.import_module("src.maimai_auto.legacy"),
     }
@@ -183,43 +182,6 @@ def load_contacted() -> dict:
     return modules["contacted"].load_contacted_candidates()
 
 
-def load_followup() -> dict:
-    modules = load_modules()
-    return modules["message_monitor"].load_state()
-
-
-FOLLOWUP_LOCK = threading.Lock()
-FOLLOWUP_THREAD: threading.Thread | None = None
-FOLLOWUP_ACTIVE = False
-
-
-def start_followup_daemon(callback: Logger = None) -> bool:
-    global FOLLOWUP_THREAD, FOLLOWUP_ACTIVE
-    modules = load_modules()
-    with FOLLOWUP_LOCK:
-        if FOLLOWUP_THREAD and FOLLOWUP_THREAD.is_alive():
-            _log(callback, "Maimai follow-up thread is already running.")
-            return False
-
-        def worker() -> None:
-            global FOLLOWUP_ACTIVE
-            FOLLOWUP_ACTIVE = True
-            try:
-                _run_with_capture(callback, modules["message_monitor"].run_message_followup, 5.0, False, None, False)
-            except Exception as exc:
-                _log(callback, f"Maimai follow-up failed: {exc}")
-            finally:
-                FOLLOWUP_ACTIVE = False
-
-        FOLLOWUP_THREAD = threading.Thread(target=worker, daemon=True, name="maimai-followup")
-        FOLLOWUP_THREAD.start()
-        return True
-
-
-def is_followup_running() -> bool:
-    return bool(FOLLOWUP_ACTIVE and FOLLOWUP_THREAD and FOLLOWUP_THREAD.is_alive())
-
-
 def run_pipeline(config: dict, callback: Logger = None) -> dict:
     modules = load_modules()
     configure_maimai_port(modules, int(config.get("maimai_port") or config.get("port") or 9225))
@@ -227,7 +189,6 @@ def run_pipeline(config: dict, callback: Logger = None) -> dict:
     legacy = modules["legacy"]
     matching = modules["matching"]
     contacted = modules["contacted"]
-    message_monitor = modules["message_monitor"]
 
     search_module = legacy.load_search_module()
     batch_module = legacy.load_resume_extract_batch_module()
@@ -235,7 +196,6 @@ def run_pipeline(config: dict, callback: Logger = None) -> dict:
 
     matching.reset_match_results()
     contacted.reset_contacted_candidates()
-    message_monitor.reset_state()
 
     _log(callback, "Start Maimai candidate search.")
     _run_with_capture(callback, search_module.run_candidate_search, settings.to_search_config())
@@ -250,7 +210,26 @@ def run_pipeline(config: dict, callback: Logger = None) -> dict:
     while processed_pages < target_pages:
         page_number = processed_pages + 1
         _log(callback, f"Start Maimai page {page_number}/{target_pages}.")
-        page_candidates = _run_with_capture(callback, batch_module.extract_current_page, page_number, candidate_limit_arg, page)
+        page_candidates = None
+        for extract_attempt in range(1, 4):
+            try:
+                page_candidates = _run_with_capture(
+                    callback,
+                    batch_module.extract_current_page,
+                    page_number,
+                    candidate_limit_arg,
+                    page,
+                )
+                break
+            except Exception as exc:
+                if exc.__class__.__name__ != "ContextLostError" or extract_attempt >= 3:
+                    raise
+                _log(
+                    callback,
+                    f"Maimai page {page_number}: page was still refreshing; "
+                    f"retry extraction {extract_attempt}/3.",
+                )
+                time.sleep(1.5)
         current_count = len(page_candidates or [])
         if current_count <= 0:
             raise RuntimeError(f"Maimai page {page_number}: no candidates extracted.")
@@ -270,11 +249,10 @@ def run_pipeline(config: dict, callback: Logger = None) -> dict:
         if not _run_with_capture(callback, batch_module.goto_next_page, page):
             raise RuntimeError(f"Maimai page {page_number}: failed to go to next page.")
 
-    if settings.actual_send and bool(config.get("maimai_followup_after_send", True)):
-        start_followup_daemon(callback)
-        _log(callback, "Maimai follow-up started.")
-    elif not settings.actual_send:
+    if not settings.actual_send:
         _log(callback, "Maimai test mode: messages were not sent and follow-up was not started.")
+    else:
+        _log(callback, "Maimai configured pages completed; pipeline finished without message monitoring.")
 
     contacted_payload = contacted.load_contacted_candidates()
     return {

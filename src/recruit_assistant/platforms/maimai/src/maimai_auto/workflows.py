@@ -1,19 +1,14 @@
 import contextlib
-import threading
 from typing import Callable, Optional
 
 from .config import SearchSettings
 from .contacted_candidates import reset_contacted_candidates
 from .legacy import load_chat_flow_module, load_resume_extract_batch_module, load_search_module
 from .logging_utils import CallbackWriter
-from .message_monitor import reset_state as reset_message_followup_state, run_message_followup
 from .matching import match_candidates, matched_candidates_path, reset_match_results
 
 
 Logger = Optional[Callable[[str], None]]
-FOLLOWUP_LOCK = threading.Lock()
-FOLLOWUP_THREAD: threading.Thread | None = None
-FOLLOWUP_ACTIVE = False
 
 
 def _log(callback: Logger, message: str):
@@ -29,32 +24,6 @@ def _run_with_capture(callback: Logger, func, *args, **kwargs):
         writer.flush()
         return result
     return func(*args, **kwargs)
-
-
-def start_message_followup_daemon(callback: Logger = None) -> bool:
-    global FOLLOWUP_THREAD, FOLLOWUP_ACTIVE
-    with FOLLOWUP_LOCK:
-        if FOLLOWUP_THREAD and FOLLOWUP_THREAD.is_alive():
-            _log(callback, "消息跟进线程已在运行，跳过重复启动。")
-            return False
-
-        def worker():
-            global FOLLOWUP_ACTIVE
-            FOLLOWUP_ACTIVE = True
-            try:
-                _run_with_capture(callback, run_message_followup, 5.0, False, None, False)
-            except Exception as exc:
-                _log(callback, f"消息跟进线程异常：{exc}")
-            finally:
-                FOLLOWUP_ACTIVE = False
-
-        FOLLOWUP_THREAD = threading.Thread(target=worker, daemon=True, name="message-followup")
-        FOLLOWUP_THREAD.start()
-        return True
-
-
-def is_message_followup_running() -> bool:
-    return bool(FOLLOWUP_ACTIVE and FOLLOWUP_THREAD and FOLLOWUP_THREAD.is_alive())
 
 
 def run_search(settings: SearchSettings, callback: Logger = None):
@@ -80,7 +49,6 @@ def run_full_pipeline(settings: SearchSettings, callback: Logger = None):
 
     reset_match_results()
     reset_contacted_candidates()
-    reset_message_followup_state()
     run_search(settings, callback)
     page = batch_module.connect_page()
 
@@ -141,10 +109,6 @@ def run_full_pipeline(settings: SearchSettings, callback: Logger = None):
                 f" 目标共 {target_pages} 页，实际仅完成 {processed_pages} 页。"
             )
 
-    if settings.actual_send:
-        _log(callback, "开始启动消息跟进：进入消息页、交换手机并持续监听回复。")
-        start_message_followup_daemon(callback)
-    else:
-        _log(callback, "当前为测试模式，已跳过消息页交换手机与回复监听。")
+    _log(callback, f"已完成设定的 {processed_pages} 页，流程结束。")
 
     return last_match_result

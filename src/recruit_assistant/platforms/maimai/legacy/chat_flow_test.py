@@ -10,6 +10,7 @@ from legacy.resume_extract import (
     open_first_candidate_card,
 )
 from src.maimai_auto.contacted_candidates import upsert_contacted_candidate
+from src.maimai_auto.message_monitor import PHONE_DONE_STATUSES, exchange_phone_for_candidate
 from src.maimai_auto.paths import runtime_root
 
 try:
@@ -87,7 +88,7 @@ def click_candidate(page, page_list_index: int) -> str:
     const card = cards[index];
     if (!card) return false;
     card.scrollIntoView({block: 'center', inline: 'nearest'});
-    for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+    for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup']) {
       card.dispatchEvent(new MouseEvent(type, {
         bubbles: true,
         cancelable: true,
@@ -115,15 +116,13 @@ def get_detail_name(page) -> str:
     return page.run_js(js) or ""
 
 
-def wait_candidate_switched(page, expected_name: str, previous_name: str, timeout: float = 2.5) -> bool:
+def wait_candidate_switched(page, expected_name: str, previous_name: str, timeout: float = 4.5) -> bool:
     end_at = time.time() + timeout
     while time.time() < end_at:
         current_name = get_detail_name(page)
         if expected_name and current_name == expected_name:
             return True
         if expected_name and expected_name in current_name:
-            return True
-        if previous_name and current_name and current_name != previous_name:
             return True
         time.sleep(0.1)
     return False
@@ -157,7 +156,25 @@ def get_chat_button_info(page):
       .filter(item => item.top < window.innerHeight * 0.35);
 
     panels.sort((a, b) => a.top - b.top || a.left - b.left);
-    return panels[0] || null;
+    if (panels.length) return panels[0];
+
+    const fallback = [...document.querySelectorAll('.mui-btn, button, a')]
+      .filter(el => isVisible(el))
+      .filter(el => wantedTexts.includes(exactText(el)))
+      .map(el => {
+        const rect = el.getBoundingClientRect();
+        return {
+          text: exactText(el),
+          left: Math.round(rect.left),
+          top: Math.round(rect.top),
+          width: Math.round(rect.width),
+          height: Math.round(rect.height),
+        };
+      })
+      .filter(item => item.left > window.innerWidth * 0.62)
+      .filter(item => item.top < window.innerHeight * 0.55);
+    fallback.sort((a, b) => a.top - b.top || a.left - b.left);
+    return fallback[0] || null;
     """
     return page.run_js(js)
 
@@ -197,7 +214,7 @@ def click_chat_button(page) -> tuple[bool, str]:
     const target = panel.querySelector('.mui-btn, [class*="mui-btn"], button, a') || panel;
     target.scrollIntoView({block: 'center', inline: 'nearest'});
 
-    ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(type => {
+    ['pointerdown', 'mousedown', 'pointerup', 'mouseup'].forEach(type => {
       target.dispatchEvent(new MouseEvent(type, {
         bubbles: true,
         cancelable: true,
@@ -218,17 +235,24 @@ def click_chat_button(page) -> tuple[bool, str]:
         return False, info["text"]
 
 
-def wait_chat_modal(page, timeout: float = 2.5) -> bool:
+def wait_chat_modal(page, timeout: float = 4.5) -> bool:
+    js = """
+    const isVisible = el => {
+      if (!el) return false;
+      const style = getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+    };
+    return [...document.querySelectorAll('.mui-modal-wrap, [role="dialog"]')].some(root => {
+      if (!isVisible(root)) return false;
+      const text = (root.innerText || '').replace(/\s+/g, ' ').trim();
+      return text.includes('招聘立即沟通') && !!root.querySelector('textarea, [contenteditable="true"]');
+    });
+    """
     end_at = time.time() + timeout
     while time.time() < end_at:
         try:
-            if page.ele("@class:settingText___13Are", timeout=0.3):
-                return True
-            if page.ele("text:索要简历", timeout=0.3):
-                return True
-            if page.ele("@tag:textarea", timeout=0.3):
-                return True
-            if page.ele("text:招聘立即沟通", timeout=0.3):
+            if page.run_js(js):
                 return True
         except Exception:
             pass
@@ -332,7 +356,7 @@ def click_modal_text(page, texts: list[str]) -> bool:
     const target = nodes[0];
     if (!target) return false;
     const clickable = target.closest('.mui-btn, [class*="mui-btn"], button, a, li, [role="menuitem"], [role="option"]') || target;
-    ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(type => {
+    ['pointerdown', 'mousedown', 'pointerup', 'mouseup'].forEach(type => {
       clickable.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
     });
     if (typeof clickable.click === 'function') clickable.click();
@@ -354,7 +378,7 @@ def click_request_option(page, target_text: str) -> bool:
     const clickNode = (node) => {
       const target = node.closest('.mui-menu-item, [role="menuitem"], li, button, a, .mui-btn, [class*="mui-btn"]') || node;
       target.scrollIntoView({block: 'center', inline: 'nearest'});
-      ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(type => {
+      ['pointerdown', 'mousedown', 'pointerup', 'mouseup'].forEach(type => {
         target.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, composed: true, view: window }));
       });
       if (typeof target.click === 'function') target.click();
@@ -448,13 +472,28 @@ def choose_request_resume(page) -> bool:
 def fill_message(page, text: str = "111") -> bool:
     js = """
     const value = arguments[0];
-    const box = document.querySelector('textarea') || document.querySelector('[contenteditable="true"]');
+    const isVisible = el => {
+      if (!el) return false;
+      const style = getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+    };
+    const root = [...document.querySelectorAll('.mui-modal-wrap, [role="dialog"]')].find(el => {
+      if (!isVisible(el)) return false;
+      return (el.innerText || '').includes('招聘立即沟通');
+    });
+    const box = root && (root.querySelector('textarea') || root.querySelector('[contenteditable="true"]'));
     if (!box) return false;
     if (box.tagName === 'TEXTAREA') {
       box.focus();
       box.select && box.select();
-      box.value = value;
-      box.dispatchEvent(new Event('input', { bubbles: true }));
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+      setter.call(box, value);
+      box.dispatchEvent(new InputEvent('input', {
+        bubbles: true,
+        data: value,
+        inputType: 'insertText',
+      }));
       box.dispatchEvent(new Event('change', { bubbles: true }));
       return true;
     }
@@ -464,13 +503,126 @@ def fill_message(page, text: str = "111") -> bool:
     box.dispatchEvent(new InputEvent('input', { bubbles: true, data: value, inputType: 'insertText' }));
     return true;
     """
-    return bool(page.run_js(js, text))
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        try:
+            if page.run_js(js, text):
+                return True
+        except Exception:
+            pass
+        time.sleep(0.2)
+    return False
 
 
-def click_send_and_stay(page) -> bool:
-    if click_modal_text(page, ["发送并留在此页", "发送后留在此页"]):
+def click_send_and_continue(page) -> bool:
+    if click_modal_text(page, ["发送后继续沟通"]):
         return True
-    return click_text_exact(page, ["发送并留在此页", "发送后留在此页"])
+    return click_text_exact(page, ["发送后继续沟通"])
+
+
+def capture_talent_page_state(page) -> dict:
+    return {
+        "tab_id": page.tab_id,
+        "tab_ids": set(page.tab_ids),
+        "url": page.url or "",
+    }
+
+
+def is_message_page(page) -> bool:
+    try:
+        return "/ent/v41/im" in (page.url or "")
+    except Exception:
+        return False
+
+
+def wait_message_page(page, state: dict, timeout: float = 12.0):
+    deadline = time.time() + timeout
+    original_tab_id = state["tab_id"]
+    original_tab_ids = state["tab_ids"]
+
+    while time.time() < deadline:
+        try:
+            tab_ids = list(page.tab_ids)
+        except Exception:
+            tab_ids = []
+
+        ordered_ids = [tab_id for tab_id in tab_ids if tab_id not in original_tab_ids]
+        if original_tab_id in tab_ids:
+            ordered_ids.append(original_tab_id)
+        ordered_ids.extend(tab_id for tab_id in tab_ids if tab_id not in ordered_ids)
+
+        for tab_id in ordered_ids:
+            try:
+                tab = page.get_tab(tab_id)
+                if is_message_page(tab):
+                    return tab, tab_id != original_tab_id
+            except Exception:
+                continue
+        time.sleep(0.25)
+
+    raise RuntimeError("发送后未进入招聘消息页面")
+
+
+def wait_talent_page_ready(page, timeout: float = 10.0, stable_seconds: float = 2.5) -> bool:
+    deadline = time.time() + timeout
+    stable_since = None
+    while time.time() < deadline:
+        try:
+            if "/ent/v41/recruit/talents" in (page.url or "") and is_candidate_detail_open(page):
+                stable_since = stable_since or time.time()
+                if time.time() - stable_since >= stable_seconds:
+                    return True
+            else:
+                stable_since = None
+        except Exception:
+            stable_since = None
+        time.sleep(0.25)
+    return False
+
+
+def restore_talent_page(browser, message_page, state: dict, opened_new_tab: bool):
+    original_tab_id = state["tab_id"]
+    if opened_new_tab:
+        try:
+            message_page.close()
+        except Exception:
+            browser.close_tabs(message_page.tab_id)
+        browser.activate_tab(original_tab_id)
+        talent_page = browser
+    else:
+        message_page.back()
+        browser.activate_tab(original_tab_id)
+        talent_page = browser
+
+    deadline = time.time() + 18.0
+    back_attempts = 0
+    detail_open_attempted = False
+    while time.time() < deadline:
+        if is_message_page(talent_page) and back_attempts < 3:
+            talent_page.back()
+            back_attempts += 1
+            detail_open_attempted = False
+            time.sleep(0.75)
+            continue
+
+        try:
+            on_talent_page = "/ent/v41/recruit/talents" in (talent_page.url or "")
+        except Exception:
+            on_talent_page = False
+
+        if on_talent_page and not is_candidate_detail_open(talent_page) and not detail_open_attempted:
+            detail_open_attempted = True
+            ensure_candidate_detail(talent_page)
+
+        if wait_talent_page_ready(talent_page, timeout=3.0, stable_seconds=2.5):
+            clear_selection(talent_page)
+            return talent_page
+
+    raise RuntimeError("消息会话关闭后未能稳定恢复人才详情页")
+
+
+def normalize_candidate_name(value: str) -> str:
+    return " ".join(str(value or "").split())
 
 
 def close_chat_modal(page) -> bool:
@@ -513,6 +665,8 @@ def run_chat_flow_test(
             "matched_total": 0,
             "processed": 0,
             "sent": 0,
+            "phone_exchanged": 0,
+            "phone_exchange_failed": 0,
             "skipped_contacted": 0,
             "failed": 0,
         }
@@ -527,12 +681,18 @@ def run_chat_flow_test(
         "matched_total": len(matched_candidates),
         "processed": 0,
         "sent": 0,
+        "phone_exchanged": 0,
+        "phone_exchange_failed": 0,
         "skipped_contacted": 0,
         "failed": 0,
     }
 
     for item in matched_candidates:
         target_index = item["page_list_index"]
+        if not ensure_candidate_detail(page):
+            print("[ERROR] 人才详情列表未能重新打开，停止处理本页后续候选人。")
+            stats["failed"] += 1
+            break
         previous_name = get_detail_name(page)
 
         try:
@@ -544,6 +704,16 @@ def run_chat_flow_test(
 
         if not wait_candidate_switched(page, name, previous_name):
             print(f"[WARN] 切换候选人详情失败：第 {target_index} 个 - {name}")
+            stats["failed"] += 1
+            continue
+
+        expected_name = normalize_candidate_name(item.get("name", ""))
+        clicked_name = normalize_candidate_name(name)
+        if expected_name and clicked_name != expected_name:
+            print(
+                f"[WARN] 候选人姓名不一致，停止联系：第 {target_index} 个 "
+                f"- AI结果 {expected_name} / 页面 {clicked_name}"
+            )
             stats["failed"] += 1
             continue
 
@@ -573,46 +743,64 @@ def run_chat_flow_test(
             stats["failed"] += 1
             continue
 
-        if not open_request_menu(page):
-            print(f"[WARN] 未找到索要设置入口：第 {target_index} 个 - {name}")
-            cleanup_chat_modal(page)
-            stats["failed"] += 1
-            continue
-
-        if not wait_text_visible(page, "索要简历"):
-            print(f"[WARN] 未等到索要简历选项：第 {target_index} 个 - {name}")
-            cleanup_chat_modal(page)
-            stats["failed"] += 1
-            continue
-
-        if not choose_request_resume(page):
-            print(f"[WARN] 未成功选择索要简历：第 {target_index} 个 - {name}")
-            cleanup_chat_modal(page)
-            stats["failed"] += 1
-            continue
-
         if not fill_message(page, greeting):
             print(f"[WARN] 未成功填写问候语：第 {target_index} 个 - {name}")
+            cleanup_chat_modal(page)
+            stats["failed"] += 1
+            continue
 
         if actual_send:
-            if click_send_and_stay(page):
-                print(f"[INFO] 已发送并留在此页：第 {target_index} 个 - {name}")
+            talent_state = capture_talent_page_state(page)
+            if not click_send_and_continue(page):
+                print(f"[WARN] 未找到“发送后继续沟通”按钮：第 {target_index} 个 - {name}")
+                cleanup_chat_modal(page)
+                stats["failed"] += 1
+                continue
+
+            contacted_at = time.strftime("%Y-%m-%d %H:%M:%S")
+            stats["processed"] += 1
+            stats["sent"] += 1
+            print(f"[INFO] 已发送并进入继续沟通流程：第 {target_index} 个 - {name}")
+
+            phone_result = {"status": "message_page_failed"}
+            message_page = None
+            opened_new_tab = False
+            try:
+                message_page, opened_new_tab = wait_message_page(page, talent_state)
+                phone_result = exchange_phone_for_candidate(message_page, name)
+                phone_status = phone_result.get("status", "unknown")
+                if phone_status in PHONE_DONE_STATUSES:
+                    stats["phone_exchanged"] += 1
+                    print(f"[INFO] 交换手机完成：第 {target_index} 个 - {name} ({phone_status})")
+                else:
+                    stats["phone_exchange_failed"] += 1
+                    stats["failed"] += 1
+                    print(f"[WARN] 交换手机失败：第 {target_index} 个 - {name} ({phone_status})")
+            except Exception as exc:
+                phone_result = {"status": "error", "error": str(exc)}
+                stats["phone_exchange_failed"] += 1
+                stats["failed"] += 1
+                print(f"[WARN] 进入会话或交换手机失败：第 {target_index} 个 - {name} - {exc}")
+            finally:
                 upsert_contacted_candidate(
                     {
                         **item,
                         "name": name or item.get("name", ""),
                         "contact_status": "sent",
-                        "contacted_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "contacted_at": contacted_at,
+                        "phone_exchange_status": phone_result.get("status", "unknown"),
                     }
                 )
-                stats["processed"] += 1
-                stats["sent"] += 1
-                cleanup_chat_modal(page)
-                time.sleep(0.5)
-            else:
-                print(f"[WARN] 未找到“发送并留在此页”按钮：第 {target_index} 个 - {name}")
-                cleanup_chat_modal(page)
+
+            try:
+                if message_page is None:
+                    message_page, opened_new_tab = wait_message_page(page, talent_state, timeout=2.0)
+                page = restore_talent_page(page, message_page, talent_state, opened_new_tab)
+                print(f"[INFO] 已关闭消息会话并返回人才页：第 {target_index} 个 - {name}")
+            except Exception as exc:
+                print(f"[ERROR] 无法返回人才页，停止处理本页后续候选人：{exc}")
                 stats["failed"] += 1
+                break
         else:
             print(f"[INFO] 已完成测试动作（未发送）：第 {target_index} 个 - {name}")
             cleanup_chat_modal(page)
