@@ -765,11 +765,13 @@ def run_chat_flow_test(
             phone_result = {"status": "message_page_failed"}
             message_page = None
             opened_new_tab = False
+            phone_exchange_done = False
             try:
                 message_page, opened_new_tab = wait_message_page(page, talent_state)
                 phone_result = exchange_phone_for_candidate(message_page, name)
                 phone_status = phone_result.get("status", "unknown")
                 if phone_status in PHONE_DONE_STATUSES:
+                    phone_exchange_done = True
                     stats["phone_exchanged"] += 1
                     print(f"[INFO] 交换手机完成：第 {target_index} 个 - {name} ({phone_status})")
                 else:
@@ -792,9 +794,14 @@ def run_chat_flow_test(
                     }
                 )
 
+            if not phone_exchange_done:
+                print(
+                    f"[ERROR] 交换手机未确认，保留消息页面并停止处理本页："
+                    f"第 {target_index} 个 - {name}"
+                )
+                break
+
             try:
-                if message_page is None:
-                    message_page, opened_new_tab = wait_message_page(page, talent_state, timeout=2.0)
                 page = restore_talent_page(page, message_page, talent_state, opened_new_tab)
                 print(f"[INFO] 已关闭消息会话并返回人才页：第 {target_index} 个 - {name}")
             except Exception as exc:

@@ -34,6 +34,13 @@ TEXT_RESERVE_TALENT = "\u50a8\u5907\u4eba\u624d"
 TEXT_NOT_SUITABLE = "\u4e0d\u5408\u9002"
 TEXT_BEFORE_REPLY_LIMIT = "\u5bf9\u65b9\u56de\u590d\u4e4b\u524d\uff0c\u6700\u591a\u53d1\u90016\u6761\u6d88\u606f"
 
+KNOWN_DIALOGUE_TOOLS = {
+    TEXT_SEND_JOB,
+    TEXT_EXCHANGE_WECHAT,
+    TEXT_RESERVE_TALENT,
+    TEXT_NOT_SUITABLE,
+}
+
 PHONE_DONE_STATUSES = {
     "requested",
     "already_requested",
@@ -400,6 +407,104 @@ def get_tool_texts(frame) -> list[str]:
     return [normalize_text(item) for item in values if normalize_text(item)]
 
 
+def get_message_ui_snapshot(frame) -> dict:
+    js = """
+    const norm = (s) => (s || '').replace(/\\u00a0/g, ' ').replace(/\\s+/g, ' ').trim();
+    const body = document.body ? document.body.innerText : '';
+    return {
+      name: norm(document.querySelector('.dialogue-header-username')?.innerText),
+      profile: norm(document.querySelector('.dialogue-header-profile, .dialogue-header-career')?.innerText),
+      tools: [...document.querySelectorAll('.tool.normal')].map(el => norm(el.innerText)).filter(Boolean),
+      session_count: document.querySelectorAll('.message-item').length,
+      body_length: body.length,
+    };
+    """
+    data = frame.run_js(js) or {}
+    return {
+        "name": normalize_text(data.get("name", "")),
+        "profile": normalize_text(data.get("profile", "")),
+        "tools": [normalize_text(item) for item in data.get("tools", []) if normalize_text(item)],
+        "session_count": int(data.get("session_count", 0) or 0),
+        "body_length": int(data.get("body_length", 0) or 0),
+    }
+
+
+def dialogue_tools_ready(tools: list[str]) -> bool:
+    values = set(tools)
+    if TEXT_EXCHANGE_PHONE in values or TEXT_REQUESTING in values:
+        return True
+    return len(values.intersection(KNOWN_DIALOGUE_TOOLS)) >= 3
+
+
+def wait_candidate_dialogue_ready(
+    page,
+    candidate_name: str,
+    timeout: float = 35.0,
+    stable_seconds: float = 1.5,
+):
+    expected_name = normalize_text(candidate_name)
+    deadline = time.time() + max(2.0, float(timeout))
+    stable_signature = None
+    stable_since = None
+    last_session_scan = 0.0
+    last_log_at = 0.0
+    last_snapshot = {
+        "name": "",
+        "profile": "",
+        "tools": [],
+        "session_count": 0,
+        "body_length": 0,
+    }
+    last_error = "message UI has not rendered"
+
+    while time.time() < deadline:
+        try:
+            frame = wait_message_frame(page, timeout=min(2.0, max(0.5, deadline - time.time())))
+            snapshot = get_message_ui_snapshot(frame)
+            last_snapshot = snapshot
+
+            if snapshot["name"] == expected_name and dialogue_tools_ready(snapshot["tools"]):
+                signature = (snapshot["name"], tuple(snapshot["tools"]))
+                if signature != stable_signature:
+                    stable_signature = signature
+                    stable_since = time.time()
+                elif stable_since and time.time() - stable_since >= stable_seconds:
+                    return frame, snapshot
+            else:
+                stable_signature = None
+                stable_since = None
+
+            now = time.time()
+            if (
+                snapshot["name"] != expected_name
+                and snapshot["session_count"] > 0
+                and now - last_session_scan >= 3.0
+            ):
+                last_session_scan = now
+                session = find_and_open_session(frame, expected_name, max_scrolls=8)
+                if session:
+                    continue
+
+            if now - last_log_at >= 4.0:
+                last_log_at = now
+                append_log(
+                    "waiting message UI: "
+                    f"expected={expected_name} opened={snapshot['name'] or '-'} "
+                    f"sessions={snapshot['session_count']} tools={snapshot['tools']}"
+                )
+        except Exception as exc:
+            last_error = str(exc)
+
+        time.sleep(0.4)
+
+    raise RuntimeError(
+        "candidate message UI not ready: "
+        f"expected={expected_name}, opened={last_snapshot['name'] or '-'}, "
+        f"sessions={last_snapshot['session_count']}, tools={last_snapshot['tools']}, "
+        f"last_error={last_error}"
+    )
+
+
 def get_body_text(frame) -> str:
     return normalize_text(frame.run_js("return document.body ? document.body.innerText : '';"))
 
@@ -414,7 +519,7 @@ def click_exchange_phone_if_present(frame) -> dict:
                 "after_tools": before_tools,
             }
         return {
-            "status": "already_processed" if before_tools else "tool_missing",
+            "status": "already_processed" if dialogue_tools_ready(before_tools) else "tool_missing",
             "before_tools": before_tools,
             "after_tools": before_tools,
         }
@@ -435,20 +540,20 @@ def click_exchange_phone_if_present(frame) -> dict:
     return true;
     """
     clicked = bool(frame.run_js(js, TEXT_EXCHANGE_PHONE))
-    time.sleep(1.5)
-    after_tools = get_tool_texts(frame)
-    body_text = get_body_text(frame)
-    if clicked and (
-        TEXT_EXCHANGE_PHONE not in after_tools
-        or TEXT_REQUESTING in after_tools
-        or TEXT_PHONE_REQUEST_SENT in body_text[-1000:]
-    ):
-        return {
-            "status": "requested",
-            "before_tools": before_tools,
-            "after_tools": after_tools,
-            "body_excerpt": body_text[-800:],
-        }
+    deadline = time.time() + 6.0
+    after_tools = before_tools
+    body_text = ""
+    while clicked and time.time() < deadline:
+        time.sleep(0.4)
+        after_tools = get_tool_texts(frame)
+        body_text = get_body_text(frame)
+        if TEXT_REQUESTING in after_tools or TEXT_PHONE_REQUEST_SENT in body_text[-1200:]:
+            return {
+                "status": "requested",
+                "before_tools": before_tools,
+                "after_tools": after_tools,
+                "body_excerpt": body_text[-800:],
+            }
     return {
         "status": "click_attempted" if clicked else "click_failed",
         "before_tools": before_tools,
@@ -457,34 +562,13 @@ def click_exchange_phone_if_present(frame) -> dict:
     }
 
 
-def exchange_phone_for_candidate(page, candidate_name: str, timeout: float = 10.0) -> dict:
+def exchange_phone_for_candidate(page, candidate_name: str, timeout: float = 35.0) -> dict:
     expected_name = normalize_text(candidate_name)
-    frame = wait_message_frame(page, timeout=timeout)
-    identity = get_open_dialogue_identity(frame)
-
-    if identity["name"] != expected_name and wait_dialogue_switched(frame, expected_name, timeout=4.0):
-        identity = get_open_dialogue_identity(frame)
-
-    if identity["name"] != expected_name:
-        session = find_and_open_session(frame, expected_name)
-        if not session:
-            return {
-                "status": "thread_not_found",
-                "expected_name": expected_name,
-                "opened_name": identity["name"],
-            }
-        identity = get_open_dialogue_identity(frame)
-
-    if identity["name"] != expected_name:
-        return {
-            "status": "dialogue_mismatch",
-            "expected_name": expected_name,
-            "opened_name": identity["name"],
-        }
+    frame, snapshot = wait_candidate_dialogue_ready(page, expected_name, timeout=timeout)
 
     result = click_exchange_phone_if_present(frame)
     result["expected_name"] = expected_name
-    result["opened_name"] = identity["name"]
+    result["opened_name"] = snapshot["name"]
     return result
 
 
