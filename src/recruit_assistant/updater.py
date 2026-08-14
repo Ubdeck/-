@@ -144,6 +144,10 @@ def download_update(asset_url: str, asset_name: str, app_dir: Path, progress_cal
                         downloaded += len(chunk)
                         if progress_callback:
                             progress_callback(downloaded, total, candidate)
+            with temp_target.open("rb") as file:
+                signature = file.read(2)
+            if signature != b"MZ" or temp_target.stat().st_size < 1024 * 1024:
+                raise RuntimeError("下载内容不是有效的 Windows exe。")
             temp_target.replace(target)
             if progress_callback:
                 progress_callback(target.stat().st_size, target.stat().st_size, candidate)
@@ -169,76 +173,70 @@ def powershell_executable() -> str:
     return str(candidate if candidate.exists() else "powershell.exe")
 
 
+def cmd_executable() -> str:
+    system_root = Path(os.environ.get("SystemRoot") or r"C:\Windows")
+    candidate = system_root / "System32" / "cmd.exe"
+    return str(candidate if candidate.exists() else "cmd.exe")
+
+
 def launch_update_installer_and_exit(downloaded_exe: Path, app_name: str) -> None:
     target_exe = current_executable()
     if target_exe is None:
         raise RuntimeError("当前是源码运行模式，只有打包后的 exe 支持一键安装更新。")
-    script = downloaded_exe.parent / "install_update.ps1"
+    script = downloaded_exe.parent / "install_update.cmd"
     log_path = downloaded_exe.parent / "install_update.log"
     script.write_text(
         """
-param(
-  [int]$TargetProcessId,
-  [string]$SourceExe,
-  [string]$TargetExe,
-  [string]$LogPath
+@echo off
+setlocal
+set "TARGET_PID=%~1"
+set "SOURCE_EXE=%~2"
+set "TARGET_EXE=%~3"
+set "LOG_PATH=%~4"
+echo %date% %time% installer start pid=%TARGET_PID% source=%SOURCE_EXE% target=%TARGET_EXE% >> "%LOG_PATH%"
+:wait_process
+tasklist /FI "PID eq %TARGET_PID%" | findstr /R /C:"%TARGET_PID%" >nul
+if not errorlevel 1 (
+  timeout /t 1 /nobreak >nul
+  goto wait_process
 )
-$ErrorActionPreference = "Stop"
-function Write-UpdateLog([string]$Message) {
-  $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $Message"
-  Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8
-}
-try {
-  Write-UpdateLog "installer start pid=$TargetProcessId source=$SourceExe target=$TargetExe"
-  Wait-Process -Id $TargetProcessId -ErrorAction SilentlyContinue
-  Start-Sleep -Milliseconds 1200
-  $backup = "$TargetExe.bak"
-  if (Test-Path -LiteralPath $TargetExe) {
-    Copy-Item -LiteralPath $TargetExe -Destination $backup -Force
-    Write-UpdateLog "backup written: $backup"
-  }
-  $copied = $false
-  for ($i = 1; $i -le 30; $i++) {
-    try {
-      Copy-Item -LiteralPath $SourceExe -Destination $TargetExe -Force
-      $copied = $true
-      Write-UpdateLog "copy success on attempt $i"
-      break
-    } catch {
-      Write-UpdateLog "copy failed on attempt $i: $($_.Exception.Message)"
-      Start-Sleep -Seconds 1
-    }
-  }
-  if (-not $copied) {
-    throw "copy update exe failed after retries"
-  }
-  Start-Process -FilePath $TargetExe -WorkingDirectory (Split-Path -Parent $TargetExe)
-  Write-UpdateLog "restarted updated app"
-} catch {
-  Write-UpdateLog "ERROR: $($_.Exception.Message)"
-  Start-Sleep -Seconds 5
-}
+timeout /t 1 /nobreak >nul
+if exist "%TARGET_EXE%" (
+  copy /Y "%TARGET_EXE%" "%TARGET_EXE%.bak" >> "%LOG_PATH%" 2>&1
+)
+set "COPIED=0"
+for /L %%I in (1,1,30) do (
+  copy /Y "%SOURCE_EXE%" "%TARGET_EXE%" >> "%LOG_PATH%" 2>&1
+  if not errorlevel 1 (
+    set "COPIED=1"
+    echo %date% %time% copy success attempt %%I >> "%LOG_PATH%"
+    goto copied
+  )
+  echo %date% %time% copy failed attempt %%I >> "%LOG_PATH%"
+  timeout /t 1 /nobreak >nul
+)
+:copied
+if "%COPIED%" NEQ "1" (
+  echo %date% %time% ERROR copy failed after retries >> "%LOG_PATH%"
+  exit /b 1
+)
+start "" "%TARGET_EXE%"
+echo %date% %time% restarted updated app >> "%LOG_PATH%"
+exit /b 0
 """.strip(),
-        encoding="utf-8-sig",
+        encoding="utf-8",
     )
     creationflags = 0
     if os.name == "nt":
         creationflags = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
     subprocess.Popen(
         [
-            powershell_executable(),
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
+            cmd_executable(),
+            "/c",
             str(script),
-            "-TargetProcessId",
             str(os.getpid()),
-            "-SourceExe",
             str(downloaded_exe),
-            "-TargetExe",
             str(target_exe),
-            "-LogPath",
             str(log_path),
         ],
         cwd=str(target_exe.parent),
