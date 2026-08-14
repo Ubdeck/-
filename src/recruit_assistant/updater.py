@@ -16,6 +16,12 @@ from .version import APP_VERSION, GITHUB_REPO
 
 GITHUB_RELEASE_API = "https://api.github.com/repos/{repo}/releases/latest"
 USER_AGENT = f"RecruitTool/{APP_VERSION}"
+URL_PROXY_PREFIXES = (
+    "",
+    "https://gh-proxy.com/",
+    "https://gh.llkk.cc/",
+    "https://ghfast.top/",
+)
 
 
 def parse_version(value: str) -> tuple[int, ...]:
@@ -31,10 +37,27 @@ def is_newer_version(latest: str, current: str = APP_VERSION) -> bool:
     return latest_parts + (0,) * (size - len(latest_parts)) > current_parts + (0,) * (size - len(current_parts))
 
 
+def candidate_urls(url: str) -> list[str]:
+    value = str(url or "").strip()
+    if not value:
+        return []
+    return [prefix + value for prefix in URL_PROXY_PREFIXES]
+
+
 def request_json(url: str, timeout: float = 8.0) -> dict:
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/vnd.github+json"})
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def request_json_with_fallback(url: str, timeout: float = 8.0) -> tuple[dict, str]:
+    errors: list[str] = []
+    for candidate in candidate_urls(url):
+        try:
+            return request_json(candidate, timeout=timeout), candidate
+        except Exception as exc:
+            errors.append(f"{candidate}: {exc}")
+    raise RuntimeError("；".join(errors[-3:]) or "所有更新源都不可用。")
 
 
 def select_release_asset(release: dict) -> dict | None:
@@ -56,7 +79,7 @@ def select_release_asset(release: dict) -> dict | None:
 
 def check_for_update(repo: str = GITHUB_REPO, current_version: str = APP_VERSION) -> dict:
     try:
-        release = request_json(GITHUB_RELEASE_API.format(repo=quote(repo, safe="/")))
+        release, source_url = request_json_with_fallback(GITHUB_RELEASE_API.format(repo=quote(repo, safe="/")))
     except HTTPError as exc:
         return {
             "ok": False,
@@ -64,6 +87,12 @@ def check_for_update(repo: str = GITHUB_REPO, current_version: str = APP_VERSION
             "error": f"GitHub Release 检查失败：HTTP {exc.code}",
         }
     except (OSError, URLError, TimeoutError, json.JSONDecodeError) as exc:
+        return {
+            "ok": False,
+            "current_version": current_version,
+            "error": f"GitHub Release 检查失败：{exc}",
+        }
+    except RuntimeError as exc:
         return {
             "ok": False,
             "current_version": current_version,
@@ -82,6 +111,7 @@ def check_for_update(repo: str = GITHUB_REPO, current_version: str = APP_VERSION
         "release_name": release.get("name") or latest_version,
         "asset_name": asset.get("name") if asset else "",
         "asset_url": asset.get("browser_download_url") if asset else "",
+        "source_url": source_url,
         "has_windows_asset": bool(asset),
     }
 
@@ -91,23 +121,40 @@ def safe_asset_name(name: str) -> str:
     return cleaned or "RecruitTool-update.exe"
 
 
-def download_update(asset_url: str, asset_name: str, app_dir: Path) -> Path:
+def download_update(asset_url: str, asset_name: str, app_dir: Path, progress_callback=None) -> Path:
     if not asset_url:
         raise RuntimeError("最新 Release 没有可下载的 Windows exe。")
     update_dir = app_dir / "runtime" / "updates"
     update_dir.mkdir(parents=True, exist_ok=True)
     target = update_dir / safe_asset_name(asset_name)
     temp_target = target.with_suffix(target.suffix + ".download")
-    request = urllib.request.Request(asset_url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(request, timeout=30) as response:
-        with temp_target.open("wb") as file:
-            while True:
-                chunk = response.read(1024 * 1024)
-                if not chunk:
-                    break
-                file.write(chunk)
-    temp_target.replace(target)
-    return target
+    errors: list[str] = []
+    for candidate in candidate_urls(asset_url):
+        try:
+            request = urllib.request.Request(candidate, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(request, timeout=45) as response:
+                total = int(response.headers.get("Content-Length") or "0")
+                downloaded = 0
+                with temp_target.open("wb") as file:
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        file.write(chunk)
+                        downloaded += len(chunk)
+                        if progress_callback:
+                            progress_callback(downloaded, total, candidate)
+            temp_target.replace(target)
+            if progress_callback:
+                progress_callback(target.stat().st_size, target.stat().st_size, candidate)
+            return target
+        except Exception as exc:
+            errors.append(f"{candidate}: {exc}")
+            try:
+                temp_target.unlink(missing_ok=True)
+            except OSError:
+                pass
+    raise RuntimeError("下载更新失败，所有下载源都不可用：" + "；".join(errors[-3:]))
 
 
 def current_executable() -> Path | None:
@@ -116,27 +163,61 @@ def current_executable() -> Path | None:
     return None
 
 
+def powershell_executable() -> str:
+    system_root = Path(os.environ.get("SystemRoot") or r"C:\Windows")
+    candidate = system_root / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    return str(candidate if candidate.exists() else "powershell.exe")
+
+
 def launch_update_installer_and_exit(downloaded_exe: Path, app_name: str) -> None:
     target_exe = current_executable()
     if target_exe is None:
         raise RuntimeError("当前是源码运行模式，只有打包后的 exe 支持一键安装更新。")
     script = downloaded_exe.parent / "install_update.ps1"
+    log_path = downloaded_exe.parent / "install_update.log"
     script.write_text(
         """
 param(
   [int]$TargetProcessId,
   [string]$SourceExe,
-  [string]$TargetExe
+  [string]$TargetExe,
+  [string]$LogPath
 )
 $ErrorActionPreference = "Stop"
-Wait-Process -Id $TargetProcessId -ErrorAction SilentlyContinue
-Start-Sleep -Milliseconds 800
-$backup = "$TargetExe.bak"
-if (Test-Path -LiteralPath $TargetExe) {
-  Copy-Item -LiteralPath $TargetExe -Destination $backup -Force
+function Write-UpdateLog([string]$Message) {
+  $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $Message"
+  Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8
 }
-Copy-Item -LiteralPath $SourceExe -Destination $TargetExe -Force
-Start-Process -FilePath $TargetExe -WorkingDirectory (Split-Path -Parent $TargetExe)
+try {
+  Write-UpdateLog "installer start pid=$TargetProcessId source=$SourceExe target=$TargetExe"
+  Wait-Process -Id $TargetProcessId -ErrorAction SilentlyContinue
+  Start-Sleep -Milliseconds 1200
+  $backup = "$TargetExe.bak"
+  if (Test-Path -LiteralPath $TargetExe) {
+    Copy-Item -LiteralPath $TargetExe -Destination $backup -Force
+    Write-UpdateLog "backup written: $backup"
+  }
+  $copied = $false
+  for ($i = 1; $i -le 30; $i++) {
+    try {
+      Copy-Item -LiteralPath $SourceExe -Destination $TargetExe -Force
+      $copied = $true
+      Write-UpdateLog "copy success on attempt $i"
+      break
+    } catch {
+      Write-UpdateLog "copy failed on attempt $i: $($_.Exception.Message)"
+      Start-Sleep -Seconds 1
+    }
+  }
+  if (-not $copied) {
+    throw "copy update exe failed after retries"
+  }
+  Start-Process -FilePath $TargetExe -WorkingDirectory (Split-Path -Parent $TargetExe)
+  Write-UpdateLog "restarted updated app"
+} catch {
+  Write-UpdateLog "ERROR: $($_.Exception.Message)"
+  Start-Sleep -Seconds 5
+}
 """.strip(),
         encoding="utf-8-sig",
     )
@@ -145,7 +226,7 @@ Start-Process -FilePath $TargetExe -WorkingDirectory (Split-Path -Parent $Target
         creationflags = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
     subprocess.Popen(
         [
-            "powershell.exe",
+            powershell_executable(),
             "-NoProfile",
             "-ExecutionPolicy",
             "Bypass",
@@ -157,9 +238,11 @@ Start-Process -FilePath $TargetExe -WorkingDirectory (Split-Path -Parent $Target
             str(downloaded_exe),
             "-TargetExe",
             str(target_exe),
+            "-LogPath",
+            str(log_path),
         ],
         cwd=str(target_exe.parent),
         creationflags=creationflags,
     )
-    time.sleep(0.2)
+    time.sleep(1.0)
     os._exit(0)

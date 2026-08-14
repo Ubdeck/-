@@ -10,6 +10,7 @@ let optionPickerTarget = "current";
 let optionPickerCategory = "";
 let optionPickerDraft = [];
 let refreshJobsTimer = null;
+let updatePollTimer = null;
 const fieldIds = [
   "platform",
   "port", "keywords", "job_name", "company_name", "current_city", "expected_city",
@@ -39,6 +40,7 @@ async function loadState(keepForm = false) {
   renderTasks();
   renderResults();
   renderLogs();
+  renderUpdateProgress(state.update_status || {});
   document.getElementById("status").textContent = state.running
     ? (state.stop_requested ? `正在停止：${state.running_task}` : `运行中：${state.running_task}`)
     : "准备就绪";
@@ -404,7 +406,41 @@ async function checkUpdate() {
     alert(installResult.error || "安装更新失败");
     return;
   }
-  alert("更新已下载，软件将自动退出并重启。");
+  renderUpdateProgress(installResult.status || {phase: "checking", message: "正在准备更新", percent: 0});
+  startUpdatePolling();
+}
+function startUpdatePolling() {
+  if (updatePollTimer) clearInterval(updatePollTimer);
+  updatePollTimer = setInterval(async () => {
+    try {
+      const result = await fetch("/api/update/status").then(res => res.json());
+      const status = result.status || {};
+      renderUpdateProgress(status);
+      if (!["checking", "downloading", "installing"].includes(status.phase)) {
+        clearInterval(updatePollTimer);
+        updatePollTimer = null;
+      }
+    } catch (err) {
+      clearInterval(updatePollTimer);
+      updatePollTimer = null;
+    }
+  }, 500);
+}
+function renderUpdateProgress(status) {
+  const box = document.getElementById("updateProgress");
+  const fill = document.getElementById("updateProgressFill");
+  const text = document.getElementById("updateProgressText");
+  if (!box || !fill || !text) return;
+  const phase = status.phase || "idle";
+  const visible = ["checking", "downloading", "installing", "error"].includes(phase);
+  box.classList.toggle("hidden", !visible);
+  const percent = Math.max(0, Math.min(100, Number(status.percent || 0)));
+  fill.style.width = `${percent}%`;
+  if (phase === "checking") text.textContent = status.message || "正在检查更新";
+  else if (phase === "downloading") text.textContent = status.message || `正在下载更新：${percent}%`;
+  else if (phase === "installing") text.textContent = status.message || "下载完成，正在安装";
+  else if (phase === "error") text.textContent = status.message || "更新失败";
+  else text.textContent = "";
 }
 function renderResults() {
   const mapComm = {done:"已确认", sent_no_chat_tab:"已发送", already_communicated:"已沟通", failed:"失败", sent:"已发送", test:"测试"};

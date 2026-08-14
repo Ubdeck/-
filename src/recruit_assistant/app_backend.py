@@ -623,6 +623,7 @@ class AppState:
         self.stop_requested = False
         self.task_stop_event = threading.Event()
         self.stop_event = threading.Event()
+        self.update_status: dict = {"phase": "idle", "message": "", "percent": 0, "downloaded": 0, "total": 0}
         self.data = self.load()
 
     def load(self) -> dict:
@@ -676,6 +677,85 @@ class AppState:
         else:
             self.add_log(str(payload))
 
+    def set_update_status(self, **values) -> dict:
+        with self.lock:
+            current = dict(self.update_status)
+            current.update(values)
+            self.update_status = current
+            return dict(self.update_status)
+
+    def start_update_install_async(self) -> dict:
+        with self.lock:
+            phase = str((self.update_status or {}).get("phase") or "")
+            if phase in {"checking", "downloading", "installing"}:
+                return dict(self.update_status)
+            self.update_status = {"phase": "checking", "message": "正在检查更新", "percent": 0, "downloaded": 0, "total": 0}
+        threading.Thread(target=self.install_update_worker, daemon=True).start()
+        return dict(self.update_status)
+
+    def install_update_worker(self) -> None:
+        try:
+            result = check_for_update()
+            if not result.get("ok"):
+                message = str(result.get("error") or "检查更新失败")
+                self.set_update_status(phase="error", message=message)
+                self.add_log(message)
+                return
+            if not result.get("update_available"):
+                message = "当前已是最新版本。"
+                self.set_update_status(phase="idle", message=message, percent=100)
+                self.add_log(message)
+                return
+            if not result.get("has_windows_asset"):
+                message = "最新 Release 没有 Windows exe 文件。"
+                self.set_update_status(phase="error", message=message)
+                self.add_log(message)
+                return
+            if not getattr(sys, "frozen", False):
+                message = "当前是源码运行模式，只有打包后的 exe 支持一键安装更新。"
+                self.set_update_status(phase="error", message=message)
+                self.add_log(message)
+                return
+
+            latest = str(result.get("latest_version") or "")
+            self.set_update_status(phase="downloading", message=f"正在下载 {latest}", percent=0, downloaded=0, total=0)
+            self.add_log(f"正在下载新版本：{latest}")
+
+            def on_progress(downloaded: int, total: int, source_url: str) -> None:
+                percent = round(downloaded * 100 / total, 1) if total else 0
+                message = f"正在下载 {latest}：{percent}%" if total else f"正在下载 {latest}：{downloaded // 1024} KB"
+                self.set_update_status(
+                    phase="downloading",
+                    message=message,
+                    percent=percent,
+                    downloaded=downloaded,
+                    total=total,
+                    source_url=source_url,
+                )
+
+            downloaded = download_update(
+                str(result.get("asset_url") or ""),
+                str(result.get("asset_name") or ""),
+                APP_DIR,
+                progress_callback=on_progress,
+            )
+            self.set_update_status(phase="installing", message="下载完成，正在退出并安装更新", percent=100)
+            self.add_log("更新已下载，软件即将退出并安装新版本。")
+
+            def run_installer() -> None:
+                try:
+                    launch_update_installer_and_exit(downloaded, APP_NAME)
+                except Exception as exc:
+                    message = f"启动更新安装器失败：{exc}"
+                    self.set_update_status(phase="error", message=message)
+                    self.add_log(message)
+
+            threading.Timer(0.8, run_installer).start()
+        except Exception as exc:
+            message = f"安装更新失败：{exc}"
+            self.set_update_status(phase="error", message=message)
+            self.add_log(message)
+
     def active_platform(self) -> str:
         task = self.find_task(str(self.data.get("active_task_id") or ""))
         if task:
@@ -708,6 +788,7 @@ class AppState:
                 "industry_groups": INDUSTRY_GROUPS,
                 "function_groups": FUNCTION_GROUPS,
                 "app_version": APP_VERSION,
+                "update_status": dict(self.update_status),
             }
 
     def find_task(self, task_id: str) -> dict | None:
@@ -1068,6 +1149,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_text(load_web_asset(asset_name), content_type)
         elif path == "/api/state":
             self.send_json(STATE.snapshot())
+        elif path == "/api/update/status":
+            self.send_json({"ok": True, "status": STATE.update_status})
         else:
             self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
@@ -1110,29 +1193,10 @@ class Handler(BaseHTTPRequestHandler):
                 STATE.add_log(str(result.get("error") or "检查更新失败"))
             self.send_json(result)
         elif path == "/api/update/install":
-            result = check_for_update()
-            if not result.get("ok"):
-                self.send_json(result, HTTPStatus.BAD_GATEWAY)
-                return
-            if not result.get("update_available"):
-                self.send_json({"ok": True, "update_available": False, "message": "当前已是最新版本。"})
-                return
-            if not result.get("has_windows_asset"):
-                self.send_json({"ok": False, "error": "最新 Release 没有 Windows exe 文件。"}, HTTPStatus.BAD_GATEWAY)
-                return
-            if not getattr(sys, "frozen", False):
-                self.send_json({"ok": False, "error": "当前是源码运行模式，只有打包后的 exe 支持一键安装更新。"}, HTTPStatus.BAD_REQUEST)
-                return
-            try:
-                STATE.add_log(f"正在下载新版本：{result.get('latest_version')}")
-                downloaded = download_update(str(result.get("asset_url") or ""), str(result.get("asset_name") or ""), APP_DIR)
-            except Exception as exc:
-                STATE.add_log(f"下载更新失败：{exc}")
-                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_GATEWAY)
-                return
-            STATE.add_log("更新已下载，软件即将退出并安装新版本。")
-            self.send_json({"ok": True, "installing": True, "downloaded": str(downloaded)})
-            threading.Timer(0.5, lambda: launch_update_installer_and_exit(downloaded, APP_NAME)).start()
+            status = STATE.start_update_install_async()
+            self.send_json({"ok": True, "status": status})
+        elif path == "/api/update/status":
+            self.send_json({"ok": True, "status": STATE.update_status})
         else:
             self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
