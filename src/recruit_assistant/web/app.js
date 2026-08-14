@@ -42,6 +42,8 @@ async function loadState(keepForm = false) {
   document.getElementById("status").textContent = state.running
     ? (state.stop_requested ? `正在停止：${state.running_task}` : `运行中：${state.running_task}`)
     : "准备就绪";
+  const versionEle = document.getElementById("appVersion");
+  if (versionEle) versionEle.textContent = `版本 ${state.app_version || "--"}`;
   const stopButton = document.getElementById("stopTaskButton");
   if (stopButton) {
     stopButton.disabled = !state.running || !!state.stop_requested;
