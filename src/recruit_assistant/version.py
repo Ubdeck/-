@@ -1,5 +1,5 @@
 from __future__ import annotations
 
 
-APP_VERSION = "0.1.0"
-GITHUB_REPO = "Ubdeck/招聘工具"
+APP_VERSION = "0.1.1"
+GITHUB_REPO = "Ubdeck/-"

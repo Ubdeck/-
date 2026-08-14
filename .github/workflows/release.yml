@@ -31,8 +31,10 @@ jobs:
           if (-not $asset) {
             throw "No exe asset was produced."
           }
+          $uploadAsset = Join-Path $asset.DirectoryName "RecruitTool.exe"
+          Copy-Item -LiteralPath $asset.FullName -Destination $uploadAsset -Force
           if (gh release view $env:TAG_NAME *> $null) {
-            gh release upload $env:TAG_NAME $asset.FullName --clobber
+            gh release upload $env:TAG_NAME $uploadAsset --clobber
           } else {
-            gh release create $env:TAG_NAME $asset.FullName --title $env:TAG_NAME --notes "自动构建版本 $env:TAG_NAME"
+            gh release create $env:TAG_NAME $uploadAsset --title $env:TAG_NAME --notes "自动构建版本 $env:TAG_NAME"
           }
