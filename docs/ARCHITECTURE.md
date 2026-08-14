@@ -11,63 +11,51 @@ run.py
 网页操作台
   -> app_backend.Handler
   -> AppState.run_task()
-     -> 猎聘: LiepinSearchPage
-     -> 脉脉: bridge.run_pipeline_subprocess()
-        -> worker.py
-        -> bridge.run_pipeline()
+     -> 平台分发
+        -> 猎聘: LiepinSearchPage
+        -> 脉脉: MaimaiRecruitPage
 ```
 
-`app_backend.py` 同时承担本地 HTTP 服务、操作台页面、任务配置、定时调度、调试浏览器启动和平台分发。平台具体行为留在 `platforms/`，不要把页面选择器继续加回后端。
+`app_backend.py` 只负责本地 HTTP API、任务配置、定时调度、浏览器启动和平台分发。页面行为必须留在 `platforms/`，前端结构、样式和交互分别放在 `web/index.html`、`web/styles.css` 和 `web/app.js`。
+
+## 状态与并发
+
+`AppState` 是桌面进程内的状态中心。任务配置持久化到 `runtime/recruit_assistant_config.json`；旧 `runtime/liepin_web_config.json` 会作为迁移来源读取。日志和结果通过 `/api/state` 返回前端。`run_lock` 保证同一时间只有一个任务执行，`task_stop_event` 用于协作式停止。
+
+定时器每 10 秒检查一次任务，以日期和分钟组合去重。定时任务与手动任务共用同一个执行锁。
 
 ## 浏览器与登录状态
 
-应用启动 Edge 时使用固定的 `--user-data-dir`，目录名称包含调试端口。相同端口会复用相同浏览器资料，因此 Cookie 和登录状态通常可以保留。手动清理浏览器资料目录、换端口，或平台主动让登录失效时才需要重新登录。
+应用通过 CDP 连接调试浏览器，并使用按端口区分的固定 `--user-data-dir`。Cookie 和登录状态属于浏览器资料目录，DrissionPage 只负责接管页面。
 
-DrissionPage 不负责保存账号，它只连接调试端口并操作现有页面。调试浏览器的创建和检查在 `app_backend.py`，平台连接方法分别在猎聘 `automation.py` 和脉脉 `browser.py`。
+浏览器进程的创建和诊断位于 `app_backend.py`。具体平台的连接适配位于各自的 `platforms/<platform>/browser.py`。
 
-## 猎聘流程
+## 猎聘模块
 
-猎聘目前集中在一个文件：`platforms/liepin/automation.py`。主要顺序是：
+`platforms/liepin/automation.py` 是兼容门面，对外继续导出 `LiepinSearchPage`、`SearchFilters` 和浏览器连接函数。内部按职责拆分：
 
-1. 连接调试浏览器并进入搜索页。
-2. 获取职位、填写筛选条件并搜索。
-3. 逐个提取候选人简历。
-4. 调用 DeepSeek 判断匹配度。
-5. 对通过候选人发起沟通和后续动作。
+| 模块 | 职责 |
+| --- | --- |
+| `workflow.py` | 填写条件、处理候选人和汇总整轮结果 |
+| `job_manager.py` | 职位管理页、分页和职位卡片提取 |
+| `candidates.py` | 候选人切换、等待和简历提取 |
+| `ai_matcher.py` | DeepSeek 请求、提示词、解析和日志 |
+| `communication.py` | 立即沟通、职位选择、聊天及联系方式请求 |
+| `filters.py` | 城市、行业、职能和下拉筛选控件 |
+| `browser.py` | CDP 连接和浏览器就绪检查 |
+| `models.py` | `SearchFilters` 和进度事件 |
 
-这个文件仍然偏大，但内部方法都属于同一个页面对象。后续拆分时应按“搜索页、候选人详情、聊天页、AI”拆，不要按临时问题随意拆文件。
+这些模块以 mixin 组合成一个门面，目的是保持外部 API 稳定，同时让页面改版影响集中在对应模块。跨模块调用通过 `LiepinSearchPage` 门面解析，不应在 mixin 之间直接互相实例化。
 
-## 脉脉流程
+## 脉脉模块
 
-脉脉入口是 `bridge.run_pipeline()`：
-
-1. `automation/search.py` 清理并填写筛选项。
-2. `automation/candidates.py` 提取当前页候选人和简历。
-3. `matching.py` 调用 DeepSeek，累积通过和拒绝结果。
-4. `automation/communication.py` 只处理当前页通过的人选。
-5. 实际发送时，沟通弹窗点击“发送后继续沟通”。
-6. 跳到消息会话页后，`phone_exchange.py` 等待候选人姓名和工具栏稳定，再点击“交换手机”。
-7. 确认交换状态后关闭消息页，恢复人才列表并继续下一人。
-8. 当前页完成后由 `candidates.goto_next_page()` 翻页。达到设定页数后直接结束，不监听后续回复。
-
-`bridge.py` 是流程编排层，不应放 CSS 选择器。`automation/` 和 `phone_exchange.py` 是页面操作层。
-
-## 为什么脉脉使用 worker
-
-脉脉流程在独立子进程中运行，主要是为了隔离长时间页面操作和 DrissionPage 状态，避免脉脉异常阻塞整个桌面操作台。主进程可以持续读取日志、响应停止按钮，并在超时时终止 worker。
-
-源码模式使用：
-
-```text
-python -m recruit_assistant.platforms.maimai.worker <config.json> <result.json>
-```
-
-打包后同一个 EXE 使用隐藏参数 `--maimai-worker` 进入 worker 模式，不会再打开第二个操作台窗口。
+`platforms/maimai/automation.py` 是脉脉招聘渠道的新门面。当前第一阶段只负责接管浏览器、打开 `https://maimai.cn/ent/v41/recruit/talents?pid=&tab=1` 并回传页面状态；搜索筛选、候选人提取、AI 匹配和沟通会按真实页面验证逐步补齐。
 
 ## 数据目录
 
-- `runtime/liepin_web_config.json`：操作台任务配置。
-- `runtime/`：猎聘日志、候选人、AI 结果。
-- `runtime/maimai/`：脉脉配置、候选人、匹配和沟通记录。
-- `dist/`：可分发 EXE。
-- `backups/`：人工保留的历史备份，不参与导入和打包。
+- `runtime/recruit_assistant_config.json`：操作台任务配置，可能包含 API Key。
+- `runtime/liepin_web_config.json`：旧猎聘配置文件，存在时作为迁移来源读取。
+- `runtime/liepin_jobs.json`：猎聘职位缓存。
+- `runtime/`：平台日志、候选人和 AI 结果。
+- `dist/`：本地构建产物，不提交 Git。
+- `backups/`：人工备份，不参与导入、测试和打包。

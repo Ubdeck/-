@@ -25,8 +25,21 @@ from urllib.parse import urlparse
 
 import psutil
 
-from .platforms.liepin import DEFAULT_MATCH_REQUIREMENTS, LiepinSearchPage, SearchFilters, connect_chromium_page
-from .platforms.maimai import bridge as maimai_bridge
+if __package__ in (None, ""):
+    package_root = Path(__file__).resolve().parents[1]
+    if str(package_root) not in sys.path:
+        sys.path.insert(0, str(package_root))
+    from recruit_assistant.environment import get_env_value
+    from recruit_assistant.platforms.liepin import DEFAULT_MATCH_REQUIREMENTS, SEARCH_URL as LIEPIN_SEARCH_URL, LiepinSearchPage, SearchFilters
+    from recruit_assistant.platforms.maimai import DEFAULT_MAIMAI_GREETING, MAIMAI_TALENTS_URL, MaimaiRecruitPage
+    from recruit_assistant.updater import check_for_update, download_update, launch_update_installer_and_exit
+    from recruit_assistant.version import APP_VERSION
+else:
+    from .environment import get_env_value
+    from .platforms.liepin import DEFAULT_MATCH_REQUIREMENTS, SEARCH_URL as LIEPIN_SEARCH_URL, LiepinSearchPage, SearchFilters
+    from .platforms.maimai import DEFAULT_MAIMAI_GREETING, MAIMAI_TALENTS_URL, MaimaiRecruitPage
+    from .updater import check_for_update, download_update, launch_update_installer_and_exit
+    from .version import APP_VERSION
 
 try:
     import winreg
@@ -54,14 +67,27 @@ def find_free_local_port(start: int = 8765) -> int:
 
 APP_DIR = get_app_dir()
 RUNTIME_DIR = APP_DIR / "runtime"
-CONFIG_PATH = RUNTIME_DIR / "liepin_web_config.json"
-JOBS_PATH = RUNTIME_DIR / "liepin_jobs.json"
+CONFIG_PATH = RUNTIME_DIR / "recruit_assistant_config.json"
+LEGACY_CONFIG_PATH = RUNTIME_DIR / "liepin_web_config.json"
 DEFAULT_REQUIREMENTS = DEFAULT_MATCH_REQUIREMENTS
 DEFAULT_BROWSER_PORT = 9225
-DEFAULT_MAIMAI_BROWSER_PORT = DEFAULT_BROWSER_PORT
-SEARCH_URL = "https://lpt.liepin.com/search"
-APP_NAME = "招聘软件助手"
+SEARCH_URL = LIEPIN_SEARCH_URL
+APP_NAME = "招聘工具"
 STARTUP_LOG_PATH = RUNTIME_DIR / "startup.log"
+PLATFORM_DEFS = {
+    "liepin": {
+        "key": "liepin",
+        "name": "猎聘",
+        "home_url": LIEPIN_SEARCH_URL,
+        "jobs_supported": True,
+    },
+    "maimai": {
+        "key": "maimai",
+        "name": "脉脉",
+        "home_url": MAIMAI_TALENTS_URL,
+        "jobs_supported": False,
+    },
+}
 LOCAL_DEBUG_ENDPOINTS = (
     ("127.0.0.1", "127.0.0.1"),
     ("localhost", "localhost"),
@@ -73,6 +99,44 @@ BROWSER_CANDIDATES = [
     r"C:\Program Files\Google\Chrome\Application\chrome.exe",
     r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
 ]
+
+WEB_ASSETS = {
+    "/assets/styles.css": ("styles.css", "text/css; charset=utf-8"),
+    "/assets/app.js": ("app.js", "text/javascript; charset=utf-8"),
+}
+
+
+def normalize_platform(value: str | None) -> str:
+    platform = str(value or "liepin").strip().lower()
+    return platform if platform in PLATFORM_DEFS else "liepin"
+
+
+def platform_name(platform: str | None) -> str:
+    return str(PLATFORM_DEFS[normalize_platform(platform)]["name"])
+
+
+def platform_home_url(platform: str | None) -> str:
+    return str(PLATFORM_DEFS[normalize_platform(platform)]["home_url"])
+
+
+def jobs_path(platform: str | None) -> Path:
+    return RUNTIME_DIR / f"{normalize_platform(platform)}_jobs.json"
+
+
+def web_asset_root() -> Path:
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS) / "recruit_assistant" / "web"
+    return Path(__file__).resolve().parent / "web"
+
+
+def load_web_asset(name: str) -> str:
+    if not name or Path(name).name != name:
+        raise ValueError(f"Invalid web asset name: {name!r}")
+    path = web_asset_root() / name
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(f"Web asset is unavailable: {path}") from exc
 
 
 def connect_platform_page(url: str, port: int):
@@ -484,13 +548,24 @@ def default_filter_config() -> dict:
         "platform": "liepin",
         "port": DEFAULT_BROWSER_PORT,
         "selected_chat_job": None,
+        "maimai_city": "",
+        "maimai_education": "",
+        "maimai_experience": "",
+        "maimai_graduation_year": "",
+        "maimai_company": "",
+        "maimai_greeting": DEFAULT_MAIMAI_GREETING,
+        "maimai_keywords": "",
+        "maimai_keyword_mode": "所有",
+        "maimai_gender": "",
+        "maimai_age_min": "",
+        "maimai_age_max": "",
         "keywords": "",
         "job_name": "",
         "company_name": "",
         "current_city": "",
         "expected_city": "",
         "experience": "",
-    "education": [],
+        "education": [],
         "recruitment_type": "",
         "school_types": [],
         "active_status": "",
@@ -508,29 +583,15 @@ def default_filter_config() -> dict:
         "use_keywords_ai_words": False,
         "use_job_ai_words": False,
         "use_company_ai_words": False,
-        "deepseek_api_key": os.environ.get("DEEPSEEK_API_KEY", ""),
+        "deepseek_api_key": get_env_value("DEEPSEEK_API_KEY"),
         "deepseek_model": "deepseek-chat",
         "match_requirements": DEFAULT_REQUIREMENTS,
         "auto_communicate": True,
         "request_resume_after_communicate": True,
         "request_phone_after_communicate": False,
         "candidate_limit": 4,
-        "maimai_keyword": "",
-        "maimai_port": DEFAULT_MAIMAI_BROWSER_PORT,
-        "maimai_keyword_mode": "所有",
-        "maimai_city": "无",
-        "maimai_education": "无",
-        "maimai_education_extra": "无",
-        "maimai_work_years": "无",
-        "maimai_graduation_year": "无",
-        "maimai_companies": "",
-        "maimai_gender": "无",
         "maimai_page_limit": 1,
-        "maimai_candidate_limit": 0,
-        "maimai_ai_requirement_text": "",
-        "maimai_greeting": "你好，我对你的简历很感兴趣，方便沟通一下吗？",
-        "maimai_actual_send": False,
-        "maimai_deepseek_base_url": "https://api.deepseek.com",
+        "maimai_auto_communicate": False,
     }
 
 
@@ -554,6 +615,7 @@ class AppState:
     def __init__(self) -> None:
         self.lock = threading.RLock()
         self.run_lock = threading.Lock()
+        self.platform_open_lock = threading.Lock()
         self.logs: list[dict] = []
         self.results: list[dict] = []
         self.running = False
@@ -564,9 +626,10 @@ class AppState:
         self.data = self.load()
 
     def load(self) -> dict:
-        if CONFIG_PATH.exists():
+        source_path = CONFIG_PATH if CONFIG_PATH.exists() else LEGACY_CONFIG_PATH
+        if source_path.exists():
             try:
-                data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+                data = json.loads(source_path.read_text(encoding="utf-8"))
             except json.JSONDecodeError:
                 data = {}
         else:
@@ -574,10 +637,6 @@ class AppState:
         defaults = default_filter_config()
         data.setdefault("defaults", defaults)
         merged_defaults = defaults | data.get("defaults", {})
-        if int(merged_defaults.get("port") or DEFAULT_BROWSER_PORT) in {9223, 9224}:
-            merged_defaults["port"] = DEFAULT_BROWSER_PORT
-        if int(merged_defaults.get("maimai_port") or DEFAULT_MAIMAI_BROWSER_PORT) in {9223, 9224}:
-            merged_defaults["maimai_port"] = DEFAULT_MAIMAI_BROWSER_PORT
         if not merged_defaults.get("match_requirements"):
             merged_defaults["match_requirements"] = DEFAULT_REQUIREMENTS
         if not merged_defaults.get("deepseek_model"):
@@ -595,6 +654,7 @@ class AppState:
         return data
 
     def save(self) -> None:
+        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
         CONFIG_PATH.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def add_log(self, message: str, event: str = "log", data: dict | None = None) -> None:
@@ -616,42 +676,38 @@ class AppState:
         else:
             self.add_log(str(payload))
 
-    def get_jobs(self) -> list[dict]:
-        if not JOBS_PATH.exists():
+    def active_platform(self) -> str:
+        task = self.find_task(str(self.data.get("active_task_id") or ""))
+        if task:
+            return normalize_platform((task.get("config") or {}).get("platform"))
+        return normalize_platform((self.data.get("defaults") or {}).get("platform"))
+
+    def get_jobs(self, platform: str | None = None) -> list[dict]:
+        path = jobs_path(platform or self.active_platform())
+        if not path.exists():
             return []
         try:
-            return json.loads(JOBS_PATH.read_text(encoding="utf-8"))
+            return json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             return []
 
     def snapshot(self) -> dict:
-        try:
-            maimai_options = maimai_bridge.maimai_options()
-        except Exception as exc:
-            maimai_options = {
-                "work_years": [],
-                "graduation_year": [],
-                "education": [],
-                "education_extra": [],
-                "gender": [],
-                "keyword_mode": [],
-                "error": str(exc),
-            }
         with self.lock:
             return {
                 "defaults": self.data.get("defaults", {}),
                 "tasks": self.data.get("tasks", []),
                 "active_task_id": self.data.get("active_task_id", ""),
                 "jobs": self.get_jobs(),
+                "platforms": list(PLATFORM_DEFS.values()),
                 "logs": self.logs[-250:],
                 "results": self.results[-200:],
                 "running": self.running,
                 "running_task": self.running_task,
                 "stop_requested": self.stop_requested,
                 "options": OPTION_GROUPS,
-                "maimai_options": maimai_options,
                 "industry_groups": INDUSTRY_GROUPS,
                 "function_groups": FUNCTION_GROUPS,
+                "app_version": APP_VERSION,
             }
 
     def find_task(self, task_id: str) -> dict | None:
@@ -678,15 +734,14 @@ class AppState:
                 "deepseek_api_key",
                 "deepseek_model",
                 "match_requirements",
+                "maimai_page_limit",
+                "maimai_auto_communicate",
+                "maimai_greeting",
                 "auto_communicate",
                 "request_resume_after_communicate",
                 "request_phone_after_communicate",
                 "candidate_limit",
                 "port",
-                "maimai_port",
-                "maimai_keyword_mode",
-                "maimai_deepseek_base_url",
-                "maimai_actual_send",
             ):
                 if key in task["config"]:
                     defaults[key] = task["config"][key]
@@ -719,12 +774,13 @@ class AppState:
         thread.start()
 
     def refresh_jobs_async(self, port: int) -> None:
-        threading.Thread(target=self.refresh_jobs, args=(port,), daemon=True).start()
+        threading.Thread(target=self.refresh_jobs, args=(self.active_platform(), port), daemon=True).start()
 
     def open_platform_async(self, platform: str, port: int) -> None:
         threading.Thread(target=self.open_platform, args=(platform, port), daemon=True).start()
 
-    def refresh_jobs(self, port: int) -> None:
+    def refresh_jobs(self, platform: str, port: int) -> None:
+        platform = normalize_platform(platform)
         if not self.run_lock.acquire(blocking=False):
             self.add_log("当前有任务正在运行，暂不刷新职位。")
             return
@@ -733,8 +789,11 @@ class AppState:
                 self.running = True
                 self.stop_requested = False
                 self.task_stop_event.clear()
-                self.running_task = "刷新职位"
-            self.add_log("正在获取职位列表...")
+                self.running_task = f"刷新{platform_name(platform)}职位"
+            if platform != "liepin":
+                self.add_log(f"{platform_name(platform)}职位列表刷新暂未接入，切换招聘渠道时会自动进入对应主界面。")
+                return
+            self.add_log("正在获取猎聘职位列表...")
             self.add_log(f"正在确认 {port} 浏览器调试端口...")
             if not ensure_debug_browser_for_work(port):
                 raise RuntimeError(f"浏览器调试端口 {port} 未就绪，请确认自动化浏览器已打开。")
@@ -768,64 +827,39 @@ class AppState:
                 self.results = []
             self.add_log(f"开始运行任务：{task.get('name', '')}（{reason}）")
             config = normalize_config(task.get("config") or {})
-            platform = config.get("platform", "liepin")
-            port = int(config.get("maimai_port") if platform == "maimai" else config.get("port") or DEFAULT_BROWSER_PORT)
+            port = int(config.get("port") or DEFAULT_BROWSER_PORT)
+            platform = normalize_platform(config.get("platform"))
             self.add_log(f"正在确认 {port} 浏览器调试端口...")
             if not ensure_debug_browser_for_work(port):
                 raise RuntimeError(f"浏览器调试端口 {port} 未就绪，请确认自动化浏览器已打开。")
-            if platform == "maimai":
-                self.add_log("进入脉脉流程：搜索、提取简历、AI匹配、沟通。")
-                result = maimai_bridge.run_pipeline_subprocess(config, self.add_log, stop_event=self.task_stop_event)
-                matches = result.get("matches", {})
-                rows = []
-                for index, item in enumerate(matches.get("matched_candidates", []), start=1):
-                    rows.append(
-                        {
-                            "index": item.get("page_list_index") or item.get("list_index") or index,
-                            "name": item.get("name", ""),
-                            "job_position": item.get("target_role", ""),
-                            "location": item.get("location", ""),
-                            "match": True,
-                            "score": item.get("match_score", 0),
-                            "communicate_status": "sent" if config.get("maimai_actual_send") else "test",
-                            "reason": item.get("reason", ""),
-                        }
-                    )
-                for index, item in enumerate(matches.get("rejected_candidates", []), start=1):
-                    rows.append(
-                        {
-                            "index": item.get("page_list_index") or item.get("list_index") or index,
-                            "name": item.get("name", ""),
-                            "job_position": item.get("target_role", ""),
-                            "location": item.get("location", ""),
-                            "match": False,
-                            "score": item.get("match_score", 0),
-                            "communicate_status": "",
-                            "reason": item.get("reason", ""),
-                        }
-                    )
-                with self.lock:
-                    self.results = rows
-                summary = f"脉脉完成：处理 {result.get('processed_pages', 0)} 页，AI通过 {result.get('matched', 0)} 人。"
-            else:
+            if platform == "liepin":
                 filters, _port = build_filters(config)
                 page = LiepinSearchPage(port=port, progress_callback=self.progress, stop_event=self.task_stop_event)
-                self.add_log("正在获取职位列表...")
+                self.add_log("正在获取猎聘职位列表...")
                 jobs = page.fetch_job_list()
                 if not filters.selected_chat_job and jobs:
                     filters.selected_chat_job = jobs[0]
-                self.add_log(f"已获取 {len(jobs)} 个职位，准备进入搜索页。")
+                self.add_log(f"已获取 {len(jobs)} 个职位，准备进入猎聘搜索页。")
                 page.open()
-                self.add_log("已进入搜索页，开始填入筛选条件并搜索。")
+                self.add_log("已进入猎聘搜索页，开始填入筛选条件并搜索。")
                 result = page.apply_filters(filters)
-                if result and "results" in result:
-                    with self.lock:
-                        self.results = result.get("results", [])
-                    summary = f"批量完成：处理 {result.get('processed', 0)} 人，匹配 {result.get('matched', 0)} 人。"
-                elif result:
-                    summary = f"完成：AI结果 {result.get('decision', '')}，{result.get('score', 0)} 分。"
+            elif platform == "maimai":
+                page = MaimaiRecruitPage(port=port, progress_callback=self.progress, stop_event=self.task_stop_event)
+                self.add_log("正在打开脉脉人才主界面。")
+                result = page.run(config)
+            else:
+                raise RuntimeError(f"暂不支持的平台：{platform}")
+            if result and "results" in result:
+                with self.lock:
+                    self.results = result.get("results", [])
+                if platform == "maimai":
+                    summary = f"脉脉批量完成：处理 {result.get('processed', 0)} 人，匹配 {result.get('matched', 0)} 人。"
                 else:
-                    summary = "已完成。"
+                    summary = f"批量完成：处理 {result.get('processed', 0)} 人，匹配 {result.get('matched', 0)} 人。"
+            elif result:
+                summary = f"完成：AI结果 {result.get('decision', '')}，{result.get('score', 0)} 分。"
+            else:
+                summary = "已完成。"
             with self.lock:
                 task["last_run_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 task["last_status"] = summary
@@ -881,20 +915,25 @@ class AppState:
         return True
 
     def open_platform(self, platform: str, port: int) -> None:
-        platform = "maimai" if str(platform or "").lower() == "maimai" else "liepin"
-        target_url = maimai_bridge.MAIMAI_URL if platform == "maimai" else SEARCH_URL
-        platform_name = "脉脉" if platform == "maimai" else "猎聘"
+        platform = normalize_platform(platform)
+        target_url = platform_home_url(platform)
+        current_platform_name = platform_name(platform)
         if self.running:
-            self.add_log(f"当前有任务正在运行，暂不切换到{platform_name}首页。")
+            self.add_log(f"当前有任务正在运行，暂不切换到{current_platform_name}首页。")
+            return
+        if not self.platform_open_lock.acquire(blocking=False):
+            self.add_log(f"正在切换到{current_platform_name}，已忽略重复请求。")
             return
         try:
-            self.add_log(f"正在打开{platform_name}初始页面：{target_url}")
+            self.add_log(f"正在打开{current_platform_name}初始页面：{target_url}")
             if not ensure_debug_browser_for_work(port):
                 raise RuntimeError(f"浏览器调试端口 {port} 未就绪。")
             connect_platform_page(target_url, port)
-            self.add_log(f"已切换当前页面到{platform_name}。")
+            self.add_log(f"已切换当前页面到{current_platform_name}。")
         except Exception as exc:
-            self.add_log(f"切换当前页面到{platform_name}失败：{exc}")
+            self.add_log(f"切换当前页面到{current_platform_name}失败：{exc}")
+        finally:
+            self.platform_open_lock.release()
 
 
 def normalize_times(values: list | str) -> list[str]:
@@ -919,12 +958,10 @@ def normalize_times(values: list | str) -> list[str]:
 def normalize_config(config: dict) -> dict:
     base = default_filter_config()
     base.update(config or {})
-    base["platform"] = "maimai" if str(base.get("platform") or "").strip().lower() == "maimai" else "liepin"
+    base["platform"] = normalize_platform(base.get("platform"))
     try:
         base["port"] = int(base.get("port") or DEFAULT_BROWSER_PORT)
     except (TypeError, ValueError):
-        base["port"] = DEFAULT_BROWSER_PORT
-    if base["port"] in {9223, 9224}:
         base["port"] = DEFAULT_BROWSER_PORT
     try:
         base["candidate_limit"] = max(int(base.get("candidate_limit") or 1), 1)
@@ -934,16 +971,8 @@ def normalize_config(config: dict) -> dict:
         base["maimai_page_limit"] = max(int(base.get("maimai_page_limit") or 1), 1)
     except (TypeError, ValueError):
         base["maimai_page_limit"] = 1
-    try:
-        base["maimai_candidate_limit"] = max(int(base.get("maimai_candidate_limit") or 0), 0)
-    except (TypeError, ValueError):
-        base["maimai_candidate_limit"] = 0
-    try:
-        base["maimai_port"] = int(base.get("maimai_port") or DEFAULT_MAIMAI_BROWSER_PORT)
-    except (TypeError, ValueError):
-        base["maimai_port"] = DEFAULT_MAIMAI_BROWSER_PORT
-    if base["maimai_port"] in {9223, 9224}:
-        base["maimai_port"] = DEFAULT_MAIMAI_BROWSER_PORT
+    if not str(base.get("maimai_greeting") or "").strip():
+        base["maimai_greeting"] = DEFAULT_MAIMAI_GREETING
     for key in ("education", "school_types"):
         value = base.get(key) or []
         if isinstance(value, str):
@@ -973,9 +1002,9 @@ def normalize_config(config: dict) -> dict:
         "use_job_ai_words",
         "use_company_ai_words",
         "auto_communicate",
+        "maimai_auto_communicate",
         "request_resume_after_communicate",
         "request_phone_after_communicate",
-        "maimai_actual_send",
     ):
         base[key] = bool(base.get(key))
     return base
@@ -1033,7 +1062,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = urlparse(self.path).path
         if path == "/":
-            self.send_text(INDEX_HTML, "text/html; charset=utf-8")
+            self.send_text(load_web_asset("index.html"), "text/html; charset=utf-8")
+        elif path in WEB_ASSETS:
+            asset_name, content_type = WEB_ASSETS[path]
+            self.send_text(load_web_asset(asset_name), content_type)
         elif path == "/api/state":
             self.send_json(STATE.snapshot())
         else:
@@ -1059,14 +1091,48 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"ok": True, "stopped": stopped})
         elif path == "/api/jobs/refresh":
             port = int(payload.get("port") or DEFAULT_BROWSER_PORT)
-            STATE.refresh_jobs_async(port)
+            platform = normalize_platform(payload.get("platform") or STATE.active_platform())
+            threading.Thread(target=STATE.refresh_jobs, args=(platform, port), daemon=True).start()
             self.send_json({"ok": True})
         elif path == "/api/platform/open":
-            platform = "maimai" if str(payload.get("platform") or "").lower() == "maimai" else "liepin"
-            default_port = DEFAULT_MAIMAI_BROWSER_PORT if platform == "maimai" else DEFAULT_BROWSER_PORT
-            port = int(payload.get("port") or default_port)
+            port = int(payload.get("port") or DEFAULT_BROWSER_PORT)
+            platform = normalize_platform(payload.get("platform") or STATE.active_platform())
             STATE.open_platform_async(platform, port)
             self.send_json({"ok": True})
+        elif path == "/api/update/check":
+            result = check_for_update()
+            if result.get("ok"):
+                if result.get("update_available"):
+                    STATE.add_log(f"发现新版本：{result.get('latest_version')}，当前版本：{result.get('current_version')}")
+                else:
+                    STATE.add_log(f"当前已是最新版本：{result.get('current_version')}")
+            else:
+                STATE.add_log(str(result.get("error") or "检查更新失败"))
+            self.send_json(result)
+        elif path == "/api/update/install":
+            result = check_for_update()
+            if not result.get("ok"):
+                self.send_json(result, HTTPStatus.BAD_GATEWAY)
+                return
+            if not result.get("update_available"):
+                self.send_json({"ok": True, "update_available": False, "message": "当前已是最新版本。"})
+                return
+            if not result.get("has_windows_asset"):
+                self.send_json({"ok": False, "error": "最新 Release 没有 Windows exe 文件。"}, HTTPStatus.BAD_GATEWAY)
+                return
+            if not getattr(sys, "frozen", False):
+                self.send_json({"ok": False, "error": "当前是源码运行模式，只有打包后的 exe 支持一键安装更新。"}, HTTPStatus.BAD_REQUEST)
+                return
+            try:
+                STATE.add_log(f"正在下载新版本：{result.get('latest_version')}")
+                downloaded = download_update(str(result.get("asset_url") or ""), str(result.get("asset_name") or ""), APP_DIR)
+            except Exception as exc:
+                STATE.add_log(f"下载更新失败：{exc}")
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_GATEWAY)
+                return
+            STATE.add_log("更新已下载，软件即将退出并安装新版本。")
+            self.send_json({"ok": True, "installing": True, "downloaded": str(downloaded)})
+            threading.Timer(0.5, lambda: launch_update_installer_and_exit(downloaded, APP_NAME)).start()
         else:
             self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
@@ -1094,944 +1160,9 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
-INDEX_HTML = r"""<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>招聘软件助手</title>
-  <style>
-    :root {
-      color-scheme: light;
-      --bg: #f6f7fb;
-      --panel: #ffffff;
-      --panel-soft: #f9fafc;
-      --text: #111827;
-      --muted: #6b7280;
-      --line: #e5e7eb;
-      --brand: #2563eb;
-      --brand-dark: #1d4ed8;
-      --ok: #059669;
-      --warn: #d97706;
-      --bad: #dc2626;
-      --shadow: 0 16px 40px rgba(15, 23, 42, .08);
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      font-family: "Microsoft YaHei UI", "Segoe UI", system-ui, sans-serif;
-      background: var(--bg);
-      color: var(--text);
-      letter-spacing: 0;
-    }
-    .app { min-height: 100vh; display: grid; grid-template-columns: 300px minmax(0, 1fr); }
-    aside {
-      background: #0f172a;
-      color: #e5e7eb;
-      padding: 22px;
-      position: sticky;
-      top: 0;
-      height: 100vh;
-      overflow: auto;
-    }
-    .brand { display: flex; align-items: center; justify-content: space-between; margin-bottom: 22px; }
-    .brand h1 { font-size: 20px; margin: 0; }
-    .pill { font-size: 12px; border: 1px solid rgba(255,255,255,.18); border-radius: 999px; padding: 5px 9px; color: #bfdbfe; }
-    .side-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 18px; }
-    button {
-      border: 0;
-      border-radius: 8px;
-      padding: 10px 12px;
-      background: var(--brand);
-      color: white;
-      cursor: pointer;
-      font-size: 14px;
-      font-weight: 600;
-    }
-    button:hover { background: var(--brand-dark); }
-    button.secondary { background: #eef2ff; color: #1e40af; }
-    button.ghost { background: rgba(255,255,255,.08); color: #e5e7eb; }
-    button.danger { background: #fee2e2; color: #991b1b; }
-    button:disabled { opacity: .55; cursor: not-allowed; }
-    .task-list { display: grid; gap: 10px; }
-    .task {
-      border: 1px solid rgba(255,255,255,.1);
-      background: rgba(255,255,255,.06);
-      border-radius: 10px;
-      padding: 12px;
-      cursor: pointer;
-    }
-    .task.active { border-color: #60a5fa; background: rgba(37,99,235,.25); }
-    .task-name { font-weight: 700; margin-bottom: 6px; }
-    .task-meta { color: #cbd5e1; font-size: 12px; line-height: 1.7; }
-    main { padding: 24px; min-width: 0; }
-    .topbar {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 14px;
-      margin-bottom: 18px;
-    }
-    .topbar h2 { margin: 0; font-size: 24px; }
-    .status { color: var(--muted); font-size: 13px; }
-    .toolbar { display: flex; gap: 10px; flex-wrap: wrap; }
-    .platform-switch {
-      display: inline-flex;
-      border: 1px solid var(--line);
-      background: white;
-      border-radius: 8px;
-      padding: 4px;
-      gap: 4px;
-    }
-    .platform-switch button {
-      min-height: 32px;
-      padding: 7px 12px;
-      background: transparent;
-      color: #334155;
-    }
-    .platform-switch button.active {
-      background: var(--brand);
-      color: white;
-    }
-    .platform-panel.hidden { display: none; }
-    .grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 14px; }
-    .card {
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 10px;
-      box-shadow: var(--shadow);
-      padding: 16px;
-    }
-    .span-4 { grid-column: span 4; }
-    .span-6 { grid-column: span 6; }
-    .span-8 { grid-column: span 8; }
-    .span-12 { grid-column: span 12; }
-    .card h3 { margin: 0 0 14px; font-size: 16px; }
-    label { display: block; color: #374151; font-size: 13px; margin-bottom: 6px; }
-    input, select, textarea {
-      width: 100%;
-      border: 1px solid #d1d5db;
-      border-radius: 8px;
-      padding: 10px 11px;
-      background: white;
-      color: var(--text);
-      font: inherit;
-      min-height: 40px;
-    }
-    textarea { min-height: 126px; resize: vertical; line-height: 1.55; }
-    .fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
-    .field.full { grid-column: 1 / -1; }
-    .range-inputs { display: grid; grid-template-columns: 1fr auto 1fr; gap: 8px; align-items: center; }
-    .range-inputs span { color: var(--muted); font-weight: 700; }
-    .checks { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; min-height: 40px; }
-    .check { display: inline-flex; align-items: center; gap: 7px; color: #374151; font-size: 13px; }
-    .check input { width: 16px; height: 16px; min-height: 0; }
-    .schedule-row { display: grid; grid-template-columns: 1fr 1fr auto; gap: 10px; align-items: end; }
-    .time-picker { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: center; }
-    .time-list { display: flex; flex-wrap: wrap; gap: 8px; min-height: 40px; align-items: center; margin-top: 10px; }
-    .time-chip {
-      display: inline-flex;
-      align-items: center;
-      gap: 7px;
-      border: 1px solid #bfdbfe;
-      background: #eff6ff;
-      color: #1d4ed8;
-      border-radius: 999px;
-      padding: 7px 10px;
-      font-size: 13px;
-      font-weight: 700;
-    }
-    .time-chip button {
-      width: 20px;
-      height: 20px;
-      min-height: 0;
-      padding: 0;
-      border-radius: 50%;
-      background: #dbeafe;
-      color: #1e40af;
-      line-height: 20px;
-      font-size: 14px;
-    }
-    .hint { color: var(--muted); font-size: 12px; line-height: 1.7; }
-    .table-wrap { overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
-    table { width: 100%; border-collapse: collapse; font-size: 13px; background: white; }
-    th, td { border-bottom: 1px solid var(--line); padding: 10px; text-align: left; vertical-align: top; }
-    th { background: var(--panel-soft); color: #374151; font-weight: 700; position: sticky; top: 0; }
-    .logs {
-      height: 260px;
-      overflow: auto;
-      background: #0b1020;
-      color: #dbeafe;
-      border-radius: 8px;
-      padding: 12px;
-      font: 13px/1.55 Consolas, "Microsoft YaHei UI", monospace;
-    }
-    .log-line { margin-bottom: 5px; }
-    .tag { display: inline-block; padding: 2px 7px; border-radius: 999px; font-size: 12px; background: #e0f2fe; color: #075985; }
-    .tag.ok { background: #dcfce7; color: #166534; }
-    .tag.bad { background: #fee2e2; color: #991b1b; }
-    .muted { color: var(--muted); }
-    .pick-box {
-      border: 1px solid #d1d5db;
-      border-radius: 8px;
-      min-height: 40px;
-      background: white;
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      gap: 8px;
-      align-items: center;
-      padding: 6px;
-    }
-    .chip-list { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; min-width: 0; }
-    .pick-chip {
-      display: inline-flex;
-      align-items: center;
-      gap: 5px;
-      border: 1px solid #bfdbfe;
-      background: #eff6ff;
-      color: #1e40af;
-      border-radius: 999px;
-      padding: 5px 8px;
-      font-size: 12px;
-      max-width: 100%;
-    }
-    .pick-chip button {
-      width: 16px;
-      height: 16px;
-      min-height: 0;
-      padding: 0;
-      border-radius: 50%;
-      background: #dbeafe;
-      color: #1e40af;
-      line-height: 16px;
-      font-size: 12px;
-    }
-    .picker-overlay {
-      position: fixed;
-      inset: 0;
-      display: none;
-      align-items: center;
-      justify-content: center;
-      background: rgba(15, 23, 42, .36);
-      z-index: 50;
-      padding: 18px;
-    }
-    .picker-overlay.open { display: flex; }
-    .industry-modal {
-      width: min(980px, 100%);
-      max-height: min(720px, calc(100vh - 36px));
-      background: white;
-      border-radius: 10px;
-      box-shadow: 0 28px 90px rgba(15, 23, 42, .24);
-      display: grid;
-      grid-template-rows: auto minmax(0, 1fr) auto;
-      overflow: hidden;
-    }
-    .industry-head {
-      height: 62px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 0 22px;
-      border-bottom: 1px solid var(--line);
-    }
-    .industry-head strong { font-size: 18px; }
-    .icon-button {
-      width: 34px;
-      height: 34px;
-      min-height: 0;
-      padding: 0;
-      background: #f3f4f6;
-      color: #111827;
-      border-radius: 8px;
-      font-size: 20px;
-      line-height: 34px;
-    }
-    .industry-body {
-      display: grid;
-      grid-template-columns: 240px minmax(0, 1fr);
-      min-height: 360px;
-      overflow: hidden;
-    }
-    .industry-cats {
-      background: #f8fafc;
-      border-right: 1px solid var(--line);
-      overflow: auto;
-      padding: 10px 8px;
-    }
-    .industry-cat {
-      width: 100%;
-      min-height: 40px;
-      text-align: left;
-      background: transparent;
-      color: #111827;
-      font-weight: 500;
-      border-radius: 6px;
-      padding: 9px 14px;
-    }
-    .industry-cat:hover, .industry-cat.active { background: #eef2f7; color: #0f172a; }
-    .industry-tags {
-      overflow: auto;
-      padding: 26px;
-      display: flex;
-      align-content: flex-start;
-      flex-wrap: wrap;
-      gap: 14px;
-    }
-    .industry-tag {
-      background: #f1f5f9;
-      color: #0f172a;
-      border: 1px solid transparent;
-      border-radius: 6px;
-      min-height: 40px;
-      padding: 9px 15px;
-      font-weight: 500;
-    }
-    .industry-tag:hover { background: #e2e8f0; }
-    .industry-tag.selected { background: #eff6ff; border-color: #93c5fd; color: #1d4ed8; }
-    .industry-foot {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 16px;
-      border-top: 1px solid var(--line);
-      padding: 16px 26px;
-      min-height: 78px;
-    }
-    .industry-selected { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; min-width: 0; }
-    @media (max-width: 1100px) {
-      .app { grid-template-columns: 1fr; }
-      aside { position: static; height: auto; }
-      .span-4, .span-6, .span-8 { grid-column: span 12; }
-    }
-    @media (max-width: 760px) {
-      main { padding: 14px; }
-      .fields, .schedule-row { grid-template-columns: 1fr; }
-      .topbar { align-items: stretch; flex-direction: column; }
-      .industry-body { grid-template-columns: 1fr; }
-      .industry-cats { display: flex; gap: 6px; overflow-x: auto; border-right: 0; border-bottom: 1px solid var(--line); }
-      .industry-cat { width: auto; white-space: nowrap; }
-    }
-  </style>
-</head>
-<body>
-<div class="app">
-  <aside>
-    <div class="brand">
-      <h1>招聘软件助手</h1>
-      <span class="pill">localhost</span>
-    </div>
-    <div class="side-actions">
-      <button class="ghost" onclick="newTask()">新建配置</button>
-      <button class="ghost" onclick="deleteTask()">删除配置</button>
-    </div>
-    <div id="taskList" class="task-list"></div>
-  </aside>
-  <main>
-    <div class="topbar">
-      <div>
-        <h2 id="pageTitle">自动搜索与沟通</h2>
-        <div id="status" class="status">正在加载...</div>
-      </div>
-      <div class="toolbar">
-        <div class="platform-switch" aria-label="平台切换">
-          <button type="button" id="platform_liepin" onclick="setPlatform('liepin')">猎聘</button>
-          <button type="button" id="platform_maimai" onclick="setPlatform('maimai')">脉脉</button>
-        </div>
-        <button class="secondary" onclick="refreshJobs()">刷新职位</button>
-        <button class="secondary" onclick="saveTask()">保存配置</button>
-        <button onclick="runTask()">立即运行</button>
-        <button id="stopTaskButton" class="danger" onclick="stopTask()" disabled>停止</button>
-      </div>
-    </div>
-
-    <div class="grid">
-      <section class="card span-8">
-        <h3>基础筛选</h3>
-        <div class="fields">
-          <div><label>配置名称</label><input id="taskName" /></div>
-          <div><label>浏览器端口</label><input id="port" type="number" min="1" /></div>
-        </div>
-        <div id="liepinPanel" class="platform-panel fields" style="margin-top:12px">
-          <div class="field full"><label>开聊职位</label><select id="selected_chat_job"></select></div>
-          <div><label>顶部关键词</label><input id="keywords" /></div>
-          <div class="checks"><label class="check"><input id="use_keywords_ai_words" type="checkbox" />关键词 AI 填词</label></div>
-          <div><label>职位名称</label><input id="job_name" /></div>
-          <div class="checks"><label class="check"><input id="use_job_ai_words" type="checkbox" />职位 AI 填词</label></div>
-          <div><label>公司名称</label><input id="company_name" /></div>
-          <div class="checks"><label class="check"><input id="use_company_ai_words" type="checkbox" />公司 AI 填词</label></div>
-          <div><label>目前城市</label><input id="current_city" /></div>
-          <div><label>期望城市</label><input id="expected_city" /></div>
-          <div><label>经验</label><select id="experience"></select></div>
-          <div><label>教育经历</label><div class="checks" id="education"></div></div>
-          <div><label>统招要求</label><select id="recruitment_type"></select></div>
-          <div><label>院校要求</label><div class="checks" id="school_types"></div></div>
-          <div class="field full">
-            <label>当前行业</label>
-            <div class="pick-box">
-              <div id="current_industries_view" class="chip-list"></div>
-              <button type="button" class="secondary" onclick="openIndustryPicker('current')">选择行业</button>
-            </div>
-          </div>
-          <div class="field full">
-            <label>期望行业</label>
-            <div class="pick-box">
-              <div id="expected_industries_view" class="chip-list"></div>
-              <button type="button" class="secondary" onclick="openIndustryPicker('expected')">选择行业</button>
-            </div>
-          </div>
-          <div class="field full">
-            <label>当前职能</label>
-            <div class="pick-box">
-              <div id="current_functions_view" class="chip-list"></div>
-              <button type="button" class="secondary" onclick="openFunctionPicker('current')">选择职能</button>
-            </div>
-          </div>
-          <div class="field full">
-            <label>期望职能</label>
-            <div class="pick-box">
-              <div id="expected_functions_view" class="chip-list"></div>
-              <button type="button" class="secondary" onclick="openFunctionPicker('expected')">选择职能</button>
-            </div>
-          </div>
-        </div>
-        <div id="maimaiPanel" class="platform-panel fields hidden" style="margin-top:12px">
-          <div><label>关键词</label><input id="maimai_keyword" placeholder="例如：研发、销售、产品经理" /></div>
-          <div><label>脉脉浏览器端口</label><input id="maimai_port" type="number" min="1" /></div>
-          <div><label>关键词模式</label><select id="maimai_keyword_mode"></select></div>
-          <div><label>城市地区</label><input id="maimai_city" placeholder="无则不筛选" /></div>
-          <div><label>页数</label><input id="maimai_page_limit" type="number" min="1" /></div>
-          <div><label>学历要求</label><select id="maimai_education"></select></div>
-          <div><label>学历附加</label><select id="maimai_education_extra"></select></div>
-          <div><label>工作年限</label><select id="maimai_work_years"></select></div>
-          <div><label>毕业年份</label><select id="maimai_graduation_year"></select></div>
-          <div><label>就职公司</label><input id="maimai_companies" placeholder="多个公司用逗号分隔" /></div>
-          <div><label>性别</label><select id="maimai_gender"></select></div>
-          <div><label>每页候选人数</label><input id="maimai_candidate_limit" type="number" min="0" placeholder="0 为不限制" /></div>
-          <div class="field full"><label>问候语</label><input id="maimai_greeting" /></div>
-          <div class="field full"><label class="check"><input id="maimai_actual_send" type="checkbox" />实际发送沟通消息</label></div>
-        </div>
-      </section>
-
-      <section class="card span-4">
-        <h3>定时任务</h3>
-        <div class="fields">
-          <div class="field full"><label>启用定时</label><label class="check"><input id="enabled" type="checkbox" />到点自动运行这一套配置</label></div>
-          <div class="field full">
-            <label>运行时间</label>
-            <div class="time-picker">
-              <input id="timePicker" type="time" step="60" />
-              <button type="button" class="secondary" onclick="addScheduleTime()">添加</button>
-            </div>
-            <div id="timeList" class="time-list"></div>
-          </div>
-          <div class="field full hint">可以保存多套配置，每套配置可添加多个时间。比如上午两个配置，下午三个配置。</div>
-        </div>
-      </section>
-
-      <section id="liepinOtherPanel" class="card span-6 platform-panel">
-        <h3>其他筛选</h3>
-        <div class="fields">
-          <div><label>活跃状态</label><select id="active_status"></select></div>
-          <div><label>求职状态</label><select id="job_status"></select></div>
-          <div><label>跳槽频率</label><select id="job_hop_frequency"></select></div>
-          <div>
-            <label>年龄要求</label>
-            <div class="range-inputs">
-              <input id="age_min" type="number" min="16" max="80" placeholder="最小" />
-              <span>-</span>
-              <input id="age_max" type="number" min="16" max="80" placeholder="最大" />
-            </div>
-          </div>
-          <div><label>性别要求</label><select id="gender_requirement"></select></div>
-          <div><label>语言要求</label><select id="language_requirement"></select></div>
-          <div><label>毕业年份</label><select id="graduation_year"></select></div>
-        </div>
-      </section>
-
-      <section class="card span-6">
-        <h3>AI 匹配与自动沟通</h3>
-        <div class="fields">
-          <div class="field full"><label>DeepSeek Key</label><input id="deepseek_api_key" type="password" /></div>
-          <div><label>模型</label><input id="deepseek_model" /></div>
-          <div id="liepinAiPanel" class="field full platform-panel">
-            <div class="fields">
-              <div><label>处理人数</label><input id="candidate_limit" type="number" min="1" /></div>
-              <div class="field full"><label class="check"><input id="auto_communicate" type="checkbox" />AI 判断通过后自动沟通；如果页面是“继续沟通”则跳过</label></div>
-              <div class="field full"><label class="check"><input id="request_resume_after_communicate" type="checkbox" />沟通成功后，打开继续沟通小窗索要简历</label></div>
-              <div class="field full"><label class="check"><input id="request_phone_after_communicate" type="checkbox" />沟通成功后，打开继续沟通小窗索要电话</label></div>
-            </div>
-          </div>
-          <div id="maimaiAiPanel" class="field full platform-panel hidden">
-            <label>DeepSeek Base URL</label>
-            <input id="maimai_deepseek_base_url" />
-          </div>
-          <div id="liepinRequirementPanel" class="field full platform-panel">
-            <label>AI筛选要求</label>
-            <textarea id="match_requirements" placeholder="例如：要有销售经验，最好做过医疗行业，成都优先，薪资别太离谱。留空则使用默认通用要求。"></textarea>
-            <div class="hint">写口语化要求即可，后台会自动整理成严谨提示词发给 AI；留空时使用默认通用要求。</div>
-          </div>
-          <div id="maimaiRequirementPanel" class="field full platform-panel hidden">
-            <label>脉脉 AI 筛选要求</label>
-            <textarea id="maimai_ai_requirement_text" placeholder="例如：必须有 B 端销售经验，优先网络安全行业，广州/深圳优先。"></textarea>
-            <div class="hint">脉脉会先提取当前页简历，再用这里的要求做 AI 判断；通过的人才会进入沟通流程。</div>
-          </div>
-        </div>
-      </section>
-
-      <section class="card span-12">
-        <h3>候选人 AI 评价</h3>
-        <div class="table-wrap">
-          <table>
-            <thead><tr><th>#</th><th>候选人</th><th>求职/城市</th><th>AI</th><th>分数</th><th>沟通</th><th>理由</th></tr></thead>
-            <tbody id="results"></tbody>
-          </table>
-        </div>
-      </section>
-
-      <section class="card span-12">
-        <h3>运行日志</h3>
-        <div id="logs" class="logs"></div>
-      </section>
-    </div>
-  </main>
-</div>
-
-<div id="industryPicker" class="picker-overlay" onclick="closeIndustryPicker(event)">
-  <div class="industry-modal" onclick="event.stopPropagation()">
-    <div class="industry-head">
-      <strong id="industryPickerTitle">请选择行业</strong>
-      <button type="button" class="icon-button" onclick="closeIndustryPicker()">×</button>
-    </div>
-    <div class="industry-body">
-      <div id="industryCats" class="industry-cats"></div>
-      <div id="industryTags" class="industry-tags"></div>
-    </div>
-    <div class="industry-foot">
-      <div id="industrySelected" class="industry-selected"></div>
-      <button type="button" onclick="confirmIndustryPicker()">确认</button>
-    </div>
-  </div>
-</div>
-
-<script>
-let state = null;
-let activeTaskId = "";
-let scheduleTimes = [];
-let currentIndustries = [];
-let expectedIndustries = [];
-let currentFunctions = [];
-let expectedFunctions = [];
-let currentPlatform = "liepin";
-let optionPickerKind = "industry";
-let optionPickerTarget = "current";
-let optionPickerCategory = "";
-let optionPickerDraft = [];
-let refreshJobsTimer = null;
-const fieldIds = [
-  "platform",
-  "port", "keywords", "job_name", "company_name", "current_city", "expected_city",
-  "experience", "recruitment_type", "active_status", "job_status",
-  "job_hop_frequency", "age_min", "age_max", "gender_requirement", "language_requirement",
-  "graduation_year", "deepseek_api_key", "deepseek_model", "candidate_limit", "match_requirements",
-  "use_keywords_ai_words", "use_job_ai_words", "use_company_ai_words", "auto_communicate",
-  "request_resume_after_communicate", "request_phone_after_communicate",
-  "maimai_keyword", "maimai_port", "maimai_keyword_mode", "maimai_city", "maimai_education", "maimai_education_extra",
-  "maimai_work_years", "maimai_graduation_year", "maimai_companies", "maimai_gender",
-  "maimai_page_limit", "maimai_candidate_limit", "maimai_ai_requirement_text", "maimai_greeting", "maimai_actual_send",
-  "maimai_deepseek_base_url"
-];
-
-function optionHtml(values, selected = "") {
-  return values.map(v => `<option value="${escapeHtml(v)}"${v === selected ? " selected" : ""}>${escapeHtml(v || "不设置")}</option>`).join("");
-}
-function escapeHtml(value) {
-  return String(value ?? "").replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
-}
-async function api(path, payload) {
-  const res = await fetch(path, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload || {})});
-  return await res.json();
-}
-async function loadState(keepForm = false) {
-  const res = await fetch("/api/state");
-  state = await res.json();
-  activeTaskId = state.active_task_id || (state.tasks[0] && state.tasks[0].id) || "";
-  renderTasks();
-  renderResults();
-  renderLogs();
-  document.getElementById("status").textContent = state.running
-    ? (state.stop_requested ? `正在停止：${state.running_task}` : `运行中：${state.running_task}`)
-    : "准备就绪";
-  const stopButton = document.getElementById("stopTaskButton");
-  if (stopButton) {
-    stopButton.disabled = !state.running || !!state.stop_requested;
-    stopButton.textContent = state.stop_requested ? "正在停止" : "停止";
-  }
-  if (!keepForm) fillForm(activeTask());
-  else renderJobSelect();
-}
-function activeTask() {
-  return (state.tasks || []).find(t => t.id === activeTaskId) || state.tasks[0];
-}
-function renderTasks() {
-  const box = document.getElementById("taskList");
-  box.innerHTML = (state.tasks || []).map(task => `
-    <div class="task ${task.id === activeTaskId ? "active" : ""}" onclick="selectTask('${task.id}')">
-      <div class="task-name">${escapeHtml(task.name)}</div>
-      <div class="task-meta">
-        ${task.enabled ? "已启用" : "未启用"} · ${(task.times || []).join(", ") || "未设时间"}<br>
-        ${escapeHtml(task.last_status || "未运行")}
-      </div>
-    </div>
-  `).join("");
-}
-function fillSelect(id, selected) {
-  document.getElementById(id).innerHTML = optionHtml(state.options[id] || [""], selected || "");
-}
-function renderCheckboxGroup(id, values, selectedValues = []) {
-  const box = document.getElementById(id);
-  if (!box) return;
-  const selected = Array.isArray(selectedValues) ? selectedValues : String(selectedValues || "").split(/[,，、;]/).map(x => x.trim()).filter(Boolean);
-  box.innerHTML = (values || []).filter(Boolean).map(label => {
-    const checked = selected.includes(label) ? "checked" : "";
-    return `<label class="check"><input type="checkbox" value="${escapeHtml(label)}" ${checked}>${escapeHtml(label)}</label>`;
-  }).join("");
-}
-function fillMaimaiSelect(id, group, selected) {
-  const ele = document.getElementById(id);
-  if (!ele) return;
-  ele.innerHTML = optionHtml((state.maimai_options || {})[group] || [""], selected || "");
-}
-function renderMaimaiOptions(cfg = {}) {
-  fillMaimaiSelect("maimai_keyword_mode", "keyword_mode", cfg.maimai_keyword_mode || "所有");
-  fillMaimaiSelect("maimai_education", "education", cfg.maimai_education || "无");
-  fillMaimaiSelect("maimai_education_extra", "education_extra", cfg.maimai_education_extra || "无");
-  fillMaimaiSelect("maimai_work_years", "work_years", cfg.maimai_work_years || "无");
-  fillMaimaiSelect("maimai_graduation_year", "graduation_year", cfg.maimai_graduation_year || "无");
-  fillMaimaiSelect("maimai_gender", "gender", cfg.maimai_gender || "无");
-}
-async function setPlatform(platform) {
-  currentPlatform = platform === "maimai" ? "maimai" : "liepin";
-  applyPlatformUI();
-  const port = currentPlatform === "maimai"
-    ? Number(document.getElementById("maimai_port").value || 9225)
-    : Number(document.getElementById("port").value || 9225);
-  try {
-    await api("/api/platform/open", {platform: currentPlatform, port});
-    await loadState(true);
-  } catch (err) {
-    console.error(err);
-  }
-}
-function applyPlatformUI() {
-  const isMaimai = currentPlatform === "maimai";
-  for (const id of ["liepinPanel", "liepinOtherPanel", "liepinAiPanel", "liepinRequirementPanel"]) {
-    document.getElementById(id)?.classList.toggle("hidden", isMaimai);
-  }
-  for (const id of ["maimaiPanel", "maimaiAiPanel", "maimaiRequirementPanel"]) {
-    document.getElementById(id)?.classList.toggle("hidden", !isMaimai);
-  }
-  document.getElementById("platform_liepin")?.classList.toggle("active", !isMaimai);
-  document.getElementById("platform_maimai")?.classList.toggle("active", isMaimai);
-  const refreshButton = document.querySelector('.toolbar button[onclick="refreshJobs()"]');
-  if (refreshButton) refreshButton.disabled = isMaimai;
-  document.getElementById("pageTitle").textContent = (activeTask()?.name || "自动搜索与沟通") + (isMaimai ? " · 脉脉" : " · 猎聘");
-}
-function renderJobSelect(cfg = null) {
-  const jobSelect = document.getElementById("selected_chat_job");
-  if (!jobSelect) return;
-  const currentLabel = jobSelect.value || "";
-  const configLabel = cfg && cfg.selected_chat_job ? formatJobLabel(cfg.selected_chat_job) : "";
-  const selectedJobLabel = currentLabel || configLabel;
-  jobSelect.innerHTML = `<option value="">自动选择第一个职位</option>` + (state.jobs || []).map(job => {
-    const label = formatJobLabel(job);
-    return `<option value="${escapeHtml(label)}"${label === selectedJobLabel ? " selected" : ""}>${escapeHtml(label)}</option>`;
-  }).join("");
-}
-function fillForm(task) {
-  if (!task) return;
-  const cfg = {...state.defaults, ...(task.config || {})};
-  currentPlatform = cfg.platform === "maimai" ? "maimai" : "liepin";
-  document.getElementById("taskName").value = task.name || "";
-  document.getElementById("enabled").checked = !!task.enabled;
-  scheduleTimes = normalizeTimes(task.times || []);
-  renderScheduleTimes();
-  for (const id of Object.keys(state.options || {})) fillSelect(id, cfg[id]);
-  renderCheckboxGroup("education", state.options.education || [], cfg.education || []);
-  renderMaimaiOptions(cfg);
-  renderJobSelect(cfg);
-  const schools = ["211", "985", "双一流", "海外留学"];
-  document.getElementById("school_types").innerHTML = schools.map(label => {
-    const checked = (cfg.school_types || []).includes(label) ? "checked" : "";
-    return `<label class="check"><input type="checkbox" value="${label}" ${checked}>${label}</label>`;
-  }).join("");
-  for (const id of fieldIds) {
-    const ele = document.getElementById(id);
-    if (!ele) continue;
-    if (ele.type === "checkbox") ele.checked = !!cfg[id];
-    else if (id === "match_requirements" && (cfg[id] || "").trim() === (state.defaults.match_requirements || "").trim()) ele.value = "";
-    else ele.value = cfg[id] ?? "";
-  }
-  currentIndustries = normalizeIndustries(cfg.current_industries || []);
-  expectedIndustries = normalizeIndustries(cfg.expected_industries || []);
-  currentFunctions = normalizeIndustries(cfg.current_functions || []);
-  expectedFunctions = normalizeIndustries(cfg.expected_functions || []);
-  renderOptionViews();
-  applyPlatformUI();
-}
-function readForm() {
-  const cfg = {};
-  for (const id of fieldIds) {
-    const ele = document.getElementById(id);
-    if (!ele) continue;
-    cfg[id] = ele.type === "checkbox" ? ele.checked : ele.value;
-  }
-  cfg.port = Number(cfg.port || 9225);
-  cfg.platform = currentPlatform;
-  cfg.candidate_limit = Number(cfg.candidate_limit || 1);
-  cfg.maimai_port = Number(cfg.maimai_port || 9225);
-  if (cfg.maimai_port === 9223) cfg.maimai_port = 9225;
-  cfg.maimai_page_limit = Number(cfg.maimai_page_limit || 1);
-  cfg.maimai_candidate_limit = Number(cfg.maimai_candidate_limit || 0);
-  cfg.school_types = Array.from(document.querySelectorAll("#school_types input:checked")).map(x => x.value);
-  cfg.education = Array.from(document.querySelectorAll("#education input:checked")).map(x => x.value);
-  cfg.current_industries = normalizeIndustries(currentIndustries);
-  cfg.expected_industries = normalizeIndustries(expectedIndustries);
-  cfg.current_functions = normalizeIndustries(currentFunctions);
-  cfg.expected_functions = normalizeIndustries(expectedFunctions);
-  const jobLabel = document.getElementById("selected_chat_job").value;
-  cfg.selected_chat_job = (state.jobs || []).find(job => formatJobLabel(job) === jobLabel) || null;
-  return {
-    id: activeTaskId || undefined,
-    name: document.getElementById("taskName").value.trim() || "未命名任务",
-    enabled: document.getElementById("enabled").checked,
-    times: scheduleTimes,
-    config: cfg
-  };
-}
-function normalizeIndustries(values) {
-  const raw = Array.isArray(values) ? values : String(values || "").split(/[，,、;；]/);
-  const result = [];
-  for (const item of raw) {
-    const value = String(item || "").trim();
-    if (value && !result.includes(value)) result.push(value);
-  }
-  return result.slice(0, 5);
-}
-function renderOptionViews() {
-  renderOptionView("current_industries", currentIndustries, "industry");
-  renderOptionView("expected_industries", expectedIndustries, "industry");
-  renderOptionView("current_functions", currentFunctions, "function");
-  renderOptionView("expected_functions", expectedFunctions, "function");
-}
-function renderOptionView(id, values, kind) {
-  const box = document.getElementById(`${id}_view`);
-  if (!box) return;
-  box.innerHTML = values.length
-    ? values.map(value => `<span class="pick-chip">${escapeHtml(value)}<button type="button" title="删除" onclick="removePickedOption('${kind}', '${id.startsWith("current") ? "current" : "expected"}', '${escapeJs(value)}')">×</button></span>`).join("")
-    : `<span class="hint">不设置</span>`;
-}
-function escapeJs(value) {
-  return String(value ?? "").replace(/\\/g, "\\\\").replace(/'/g, "\\'");
-}
-function removePickedOption(kind, type, value) {
-  if (kind === "industry" && type === "current") currentIndustries = currentIndustries.filter(item => item !== value);
-  else if (kind === "industry") expectedIndustries = expectedIndustries.filter(item => item !== value);
-  else if (type === "current") currentFunctions = currentFunctions.filter(item => item !== value);
-  else expectedFunctions = expectedFunctions.filter(item => item !== value);
-  renderOptionViews();
-}
-function openIndustryPicker(type) {
-  openOptionPicker("industry", type);
-}
-function openFunctionPicker(type) {
-  openOptionPicker("function", type);
-}
-function openOptionPicker(kind, type) {
-  optionPickerKind = kind;
-  optionPickerTarget = type;
-  optionPickerDraft = normalizeIndustries(
-    kind === "industry"
-      ? (type === "current" ? currentIndustries : expectedIndustries)
-      : (type === "current" ? currentFunctions : expectedFunctions)
-  );
-  const categories = Object.keys(getOptionGroups(kind));
-  optionPickerCategory = categories[0] || "";
-  document.getElementById("industryPickerTitle").textContent = type === "current" ? "请选择当前行业" : "请选择期望行业";
-  if (kind === "function") {
-    document.getElementById("industryPickerTitle").textContent = type === "current" ? "请选择当前职能" : "请选择期望职能";
-  }
-  document.getElementById("industryPicker").classList.add("open");
-  renderOptionPicker();
-}
-function closeIndustryPicker(event) {
-  if (event && event.target && event.target.id !== "industryPicker") return;
-  document.getElementById("industryPicker").classList.remove("open");
-}
-function getOptionGroups(kind) {
-  return kind === "function" ? (state.function_groups || {}) : (state.industry_groups || {});
-}
-function renderIndustryPicker() {
-  renderOptionPicker();
-}
-function renderOptionPicker() {
-  const groups = getOptionGroups(optionPickerKind);
-  const categories = Object.keys(groups);
-  if (!optionPickerCategory && categories.length) optionPickerCategory = categories[0];
-  document.getElementById("industryCats").innerHTML = categories.map(category => (
-    `<button type="button" class="industry-cat ${category === optionPickerCategory ? "active" : ""}" onclick="selectIndustryCategory('${escapeJs(category)}')">${escapeHtml(category)}</button>`
-  )).join("");
-  const values = groups[optionPickerCategory] || [];
-  document.getElementById("industryTags").innerHTML = values.map(value => {
-    const selected = optionPickerDraft.includes(value);
-    return `<button type="button" class="industry-tag ${selected ? "selected" : ""}" onclick="toggleIndustry('${escapeJs(value)}')">${escapeHtml(value)}</button>`;
-  }).join("");
-  document.getElementById("industrySelected").innerHTML = `
-    <span class="muted">已选（${optionPickerDraft.length}/5）</span>
-    ${optionPickerDraft.map(value => `<span class="pick-chip">${escapeHtml(value)}<button type="button" title="删除" onclick="toggleIndustry('${escapeJs(value)}')">×</button></span>`).join("")}
-  `;
-}
-function selectIndustryCategory(category) {
-  optionPickerCategory = category;
-  renderOptionPicker();
-}
-function toggleIndustry(value) {
-  if (optionPickerDraft.includes(value)) {
-    optionPickerDraft = optionPickerDraft.filter(item => item !== value);
-  } else if (optionPickerDraft.length < 5) {
-    optionPickerDraft.push(value);
-  }
-  renderOptionPicker();
-}
-function confirmIndustryPicker() {
-  if (optionPickerKind === "industry" && optionPickerTarget === "current") currentIndustries = normalizeIndustries(optionPickerDraft);
-  else if (optionPickerKind === "industry") expectedIndustries = normalizeIndustries(optionPickerDraft);
-  else if (optionPickerTarget === "current") currentFunctions = normalizeIndustries(optionPickerDraft);
-  else expectedFunctions = normalizeIndustries(optionPickerDraft);
-  renderOptionViews();
-  closeIndustryPicker();
-}
-function normalizeTimes(values) {
-  const raw = Array.isArray(values) ? values : String(values || "").split(/[，,;；]/);
-  const result = [];
-  for (const item of raw) {
-    const value = String(item || "").trim();
-    if (!/^\d{1,2}:\d{2}$/.test(value)) continue;
-    const [h, m] = value.split(":").map(Number);
-    if (h < 0 || h > 23 || m < 0 || m > 59) continue;
-    const normalized = `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
-    if (!result.includes(normalized)) result.push(normalized);
-  }
-  return result.sort();
-}
-function renderScheduleTimes() {
-  const box = document.getElementById("timeList");
-  box.innerHTML = scheduleTimes.length
-    ? scheduleTimes.map(time => `<span class="time-chip">${escapeHtml(time)}<button type="button" title="删除" onclick="removeScheduleTime('${time}')">×</button></span>`).join("")
-    : `<span class="hint">还没有添加运行时间</span>`;
-}
-function addScheduleTime() {
-  const input = document.getElementById("timePicker");
-  const value = normalizeTimes([input.value])[0];
-  if (!value) return;
-  if (!scheduleTimes.includes(value)) scheduleTimes.push(value);
-  scheduleTimes = normalizeTimes(scheduleTimes);
-  input.value = "";
-  renderScheduleTimes();
-}
-function removeScheduleTime(time) {
-  scheduleTimes = scheduleTimes.filter(item => item !== time);
-  renderScheduleTimes();
-}
-function formatJobLabel(job) {
-  return job.label || [job.title, job.city, job.salary].filter(Boolean).join(" | ");
-}
-async function selectTask(id) {
-  activeTaskId = id;
-  await api("/api/tasks/active", {id});
-  await loadState(false);
-}
-async function newTask() {
-  const payload = readForm();
-  payload.id = undefined;
-  payload.name = "新配置 " + new Date().toLocaleTimeString("zh-CN", {hour12:false}).slice(0,5);
-  payload.enabled = false;
-  const res = await api("/api/tasks/save", payload);
-  activeTaskId = res.task.id;
-  await loadState(false);
-}
-async function deleteTask() {
-  if (!activeTaskId || !confirm("确定删除当前配置？")) return;
-  await api("/api/tasks/delete", {id: activeTaskId});
-  await loadState(false);
-}
-async function saveTask() {
-  const res = await api("/api/tasks/save", readForm());
-  activeTaskId = res.task.id;
-  await loadState(false);
-}
-async function runTask() {
-  await saveTask();
-  await api("/api/tasks/run", {id: activeTaskId});
-  setTimeout(() => loadState(true), 500);
-}
-async function stopTask() {
-  const button = document.getElementById("stopTaskButton");
-  if (button) {
-    button.disabled = true;
-    button.textContent = "正在停止";
-  }
-  await api("/api/tasks/stop", {});
-  const startedAt = Date.now();
-  const timer = setInterval(async () => {
-    await loadState(true);
-    if (!state.running || Date.now() - startedAt > 30000) clearInterval(timer);
-  }, 1000);
-}
-async function refreshJobs() {
-  const port = Number(document.getElementById("port").value || 9225);
-  await api("/api/jobs/refresh", {port});
-  if (refreshJobsTimer) clearInterval(refreshJobsTimer);
-  const startedAt = Date.now();
-  refreshJobsTimer = setInterval(async () => {
-    await loadState(true);
-    if (!state.running || Date.now() - startedAt > 60000) {
-      clearInterval(refreshJobsTimer);
-      refreshJobsTimer = null;
-      await loadState(true);
-    }
-  }, 1000);
-}
-function renderResults() {
-  const mapComm = {done:"已确认", already_communicated:"已沟通", failed:"失败", sent:"已发送", test:"测试"};
-  const mapResume = {requested:"已索要", already_requested:"已索要", already_available:"已可看", not_found:"未找到会话", failed:"索要失败"};
-  const mapPhone = {requested:"电话已索要", already_requested:"电话已索要", already_available:"电话可查看", not_found:"未找到会话", failed:"电话失败"};
-  document.getElementById("results").innerHTML = (state.results || []).map(item => `
-    <tr>
-      <td>${escapeHtml(item.index || "")}</td>
-      <td>${escapeHtml(item.name || "")}</td>
-      <td>${escapeHtml([item.job_position, item.location || item.job_cities].filter(Boolean).join(" / "))}</td>
-      <td><span class="tag ${item.match ? "ok" : "bad"}">${item.match ? "匹配" : "不匹配"}</span></td>
-      <td>${escapeHtml(item.score || 0)}</td>
-      <td title="${escapeHtml([item.communicate_note, item.phone_request_note, item.resume_request_note].filter(Boolean).join('；'))}">${escapeHtml([mapComm[item.communicate_status] || item.communicate_status || "", mapPhone[item.phone_request_status] || "", mapResume[item.resume_request_status] || ""].filter(Boolean).join(" / "))}</td>
-      <td>${escapeHtml(item.reason || "")}</td>
-    </tr>
-  `).join("");
-}
-function renderLogs() {
-  const box = document.getElementById("logs");
-  box.innerHTML = (state.logs || []).map(log => `<div class="log-line"><span class="muted">${escapeHtml(log.time)}</span> ${escapeHtml(log.message)}</div>`).join("");
-  box.scrollTop = box.scrollHeight;
-}
-setInterval(() => loadState(true), 2500);
-loadState(false);
-</script>
-</body>
-</html>
-"""
 
 def start_server(host: str = "127.0.0.1", port: int = 8765, open_browser: bool = False) -> tuple[ThreadingHTTPServer, str]:
-    ensure_edge_debugging(DEFAULT_BROWSER_PORT, default_url=SEARCH_URL)
+    ensure_edge_debugging(DEFAULT_BROWSER_PORT, default_url=platform_home_url(STATE.active_platform()))
     threading.Thread(target=STATE.scheduler_loop, daemon=True).start()
     server = ThreadingHTTPServer((host, port), Handler)
     url = f"http://{host}:{port}"

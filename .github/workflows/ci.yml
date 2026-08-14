@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install project
+        run: python -m pip install --upgrade pip && python -m pip install -e .
+      - name: Compile Python sources
+        shell: pwsh
+        run: |
+          $files = @(Get-ChildItem .\src -Recurse -Filter '*.py' | Select-Object -ExpandProperty FullName)
+          $files += (Resolve-Path .\run.py).Path
+          python -m py_compile $files
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v

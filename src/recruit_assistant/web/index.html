@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>招聘工具</title>
+  <link rel="stylesheet" href="/assets/styles.css" />
+</head>
+<body>
+<div class="app">
+  <aside>
+    <div class="brand">
+      <h1>招聘工具</h1>
+      <span class="pill">localhost</span>
+    </div>
+    <div class="side-actions">
+      <button class="ghost" onclick="newTask()">新建配置</button>
+      <button class="ghost" onclick="deleteTask()">删除配置</button>
+    </div>
+    <div id="taskList" class="task-list"></div>
+  </aside>
+  <main>
+    <div class="topbar">
+      <div>
+        <h2 id="pageTitle">自动搜索与沟通</h2>
+        <div id="status" class="status">正在加载...</div>
+      </div>
+      <div class="toolbar">
+        <button class="secondary" onclick="refreshJobs()">刷新职位</button>
+        <button class="secondary" onclick="checkUpdate()">检查更新</button>
+        <button class="secondary" onclick="saveTask()">保存配置</button>
+        <button onclick="runTask()">立即运行</button>
+        <button id="stopTaskButton" class="danger" onclick="stopTask()" disabled>停止</button>
+      </div>
+    </div>
+
+    <div class="grid">
+      <section class="card span-8">
+        <h3>基础筛选</h3>
+        <div class="fields">
+          <div><label>配置名称</label><input id="taskName" /></div>
+          <div><label>招聘渠道</label><select id="platform" onchange="onPlatformChange()"><option value="liepin">猎聘</option><option value="maimai">脉脉</option></select></div>
+          <div><label>浏览器端口</label><input id="port" type="number" min="1" /></div>
+        </div>
+        <div id="liepinPanel" class="platform-panel fields" style="margin-top:12px">
+          <div class="field full"><label>开聊职位</label><select id="selected_chat_job"></select></div>
+          <div><label>顶部关键词</label><input id="keywords" /></div>
+          <div class="checks"><label class="check"><input id="use_keywords_ai_words" type="checkbox" />关键词 AI 填词</label></div>
+          <div><label>职位名称</label><input id="job_name" /></div>
+          <div class="checks"><label class="check"><input id="use_job_ai_words" type="checkbox" />职位 AI 填词</label></div>
+          <div><label>公司名称</label><input id="company_name" /></div>
+          <div class="checks"><label class="check"><input id="use_company_ai_words" type="checkbox" />公司 AI 填词</label></div>
+          <div><label>目前城市</label><input id="current_city" /></div>
+          <div><label>期望城市</label><input id="expected_city" /></div>
+          <div><label>经验</label><select id="experience"></select></div>
+          <div><label>教育经历</label><div class="checks" id="education"></div></div>
+          <div><label>统招要求</label><select id="recruitment_type"></select></div>
+          <div><label>院校要求</label><div class="checks" id="school_types"></div></div>
+          <div class="field full">
+            <label>当前行业</label>
+            <div class="pick-box">
+              <div id="current_industries_view" class="chip-list"></div>
+              <button type="button" class="secondary" onclick="openIndustryPicker('current')">选择行业</button>
+            </div>
+          </div>
+          <div class="field full">
+            <label>期望行业</label>
+            <div class="pick-box">
+              <div id="expected_industries_view" class="chip-list"></div>
+              <button type="button" class="secondary" onclick="openIndustryPicker('expected')">选择行业</button>
+            </div>
+          </div>
+          <div class="field full">
+            <label>当前职能</label>
+            <div class="pick-box">
+              <div id="current_functions_view" class="chip-list"></div>
+              <button type="button" class="secondary" onclick="openFunctionPicker('current')">选择职能</button>
+            </div>
+          </div>
+          <div class="field full">
+            <label>期望职能</label>
+            <div class="pick-box">
+              <div id="expected_functions_view" class="chip-list"></div>
+              <button type="button" class="secondary" onclick="openFunctionPicker('expected')">选择职能</button>
+            </div>
+          </div>
+        </div>
+        <div id="maimaiPanel" class="platform-panel fields hidden" style="margin-top:12px">
+          <div><label>搜索关键词</label><input id="maimai_keywords" /></div>
+          <div><label>关键词模式</label><select id="maimai_keyword_mode"><option>所有</option><option>任一</option></select></div>
+          <div><label>城市地区</label><input id="maimai_city" /></div>
+          <div><label>学历要求</label><select id="maimai_education"><option value="">不设置</option><option>专科及以上</option><option>本科及以上</option><option>本科及以上（只看统招本科）</option><option>硕士及以上</option><option>博士</option></select></div>
+          <div><label>工作年限</label><select id="maimai_experience"><option value="">不设置</option><option>在校/应届</option><option>1年以内</option><option>1-3年</option><option>3-5年</option><option>5-10年</option><option>10年以上</option></select></div>
+          <div><label>毕业年份</label><select id="maimai_graduation_year"><option value="">不设置</option><option>2025年毕业</option><option>2026年毕业</option><option>2027年毕业</option><option>2028年毕业</option><option>2029年毕业</option><option>2030年毕业</option></select></div>
+          <div><label>就职公司</label><input id="maimai_company" /></div>
+          <div><label>性别</label><select id="maimai_gender"><option value="">不设置</option><option>不限</option><option>男</option><option>女</option></select></div>
+          <div><label>最低年龄</label><input id="maimai_age_min" type="number" min="16" max="80" /></div>
+          <div><label>最高年龄</label><input id="maimai_age_max" type="number" min="16" max="80" /></div>
+        </div>
+      </section>
+
+      <section class="card span-4">
+        <h3>定时任务</h3>
+        <div class="fields">
+          <div class="field full"><label>启用定时</label><label class="check"><input id="enabled" type="checkbox" />到点自动运行这一套配置</label></div>
+          <div class="field full">
+            <label>运行时间</label>
+            <div class="time-picker">
+              <input id="timePicker" type="time" step="60" />
+              <button type="button" class="secondary" onclick="addScheduleTime()">添加</button>
+            </div>
+            <div id="timeList" class="time-list"></div>
+          </div>
+          <div class="field full hint">可以保存多套配置，每套配置可添加多个时间。比如上午两个配置，下午三个配置。</div>
+        </div>
+      </section>
+
+      <section id="liepinOtherPanel" class="card span-6 platform-panel">
+        <h3>其他筛选</h3>
+        <div class="fields">
+          <div><label>活跃状态</label><select id="active_status"></select></div>
+          <div><label>求职状态</label><select id="job_status"></select></div>
+          <div><label>跳槽频率</label><select id="job_hop_frequency"></select></div>
+          <div>
+            <label>年龄要求</label>
+            <div class="range-inputs">
+              <input id="age_min" type="number" min="16" max="80" placeholder="最小" />
+              <span>-</span>
+              <input id="age_max" type="number" min="16" max="80" placeholder="最大" />
+            </div>
+          </div>
+          <div><label>性别要求</label><select id="gender_requirement"></select></div>
+          <div><label>语言要求</label><select id="language_requirement"></select></div>
+          <div><label>毕业年份</label><select id="graduation_year"></select></div>
+        </div>
+      </section>
+
+      <section class="card span-6">
+        <h3>AI 匹配与自动沟通</h3>
+        <div class="fields">
+          <div class="field full"><label>DeepSeek Key</label><input id="deepseek_api_key" type="password" /></div>
+          <div><label>模型</label><input id="deepseek_model" /></div>
+          <div id="liepinAiPanel" class="field full platform-panel">
+            <div class="fields">
+              <div><label>处理人数</label><input id="candidate_limit" type="number" min="1" /></div>
+              <div class="field full"><label class="check"><input id="auto_communicate" type="checkbox" />AI 判断通过后自动沟通；如果页面是“继续沟通”则跳过</label></div>
+              <div class="field full"><label class="check"><input id="request_resume_after_communicate" type="checkbox" />沟通成功后，打开继续沟通小窗索要简历</label></div>
+              <div class="field full"><label class="check"><input id="request_phone_after_communicate" type="checkbox" />沟通成功后，打开继续沟通小窗索要电话</label></div>
+            </div>
+          </div>
+          <div id="maimaiAiPanel" class="field full platform-panel hidden">
+            <div class="fields">
+              <div><label>处理页数</label><input id="maimai_page_limit" type="number" min="1" /></div>
+              <div class="field full"><label>招呼语</label><textarea id="maimai_greeting" placeholder="例如：您好，我这边有个岗位和您的经历比较匹配，想和您进一步沟通一下。"></textarea></div>
+              <div class="field full"><label class="check"><input id="maimai_auto_communicate" type="checkbox" />AI 判断通过后实际沟通，并在消息页申请交换手机</label></div>
+            </div>
+          </div>
+          <div id="aiRequirementPanel" class="field full platform-panel">
+            <label>AI筛选要求</label>
+            <textarea id="match_requirements" placeholder="例如：要有销售经验，最好做过医疗行业，成都优先，薪资别太离谱。留空则使用默认通用要求。"></textarea>
+            <div class="hint">写口语化要求即可，后台会把它整理成判断标准发给 AI。猎聘和脉脉都会用这套要求；留空时使用默认通用要求。</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card span-12">
+        <h3>候选人 AI 评价</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>#</th><th>候选人</th><th>求职/城市</th><th>AI</th><th>分数</th><th>沟通</th><th>理由</th></tr></thead>
+            <tbody id="results"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card span-12">
+        <h3>运行日志</h3>
+        <div id="logs" class="logs"></div>
+      </section>
+    </div>
+  </main>
+</div>
+
+<div id="industryPicker" class="picker-overlay" onclick="closeIndustryPicker(event)">
+  <div class="industry-modal" onclick="event.stopPropagation()">
+    <div class="industry-head">
+      <strong id="industryPickerTitle">请选择行业</strong>
+      <button type="button" class="icon-button" onclick="closeIndustryPicker()">×</button>
+    </div>
+    <div class="industry-body">
+      <div id="industryCats" class="industry-cats"></div>
+      <div id="industryTags" class="industry-tags"></div>
+    </div>
+    <div class="industry-foot">
+      <div id="industrySelected" class="industry-selected"></div>
+      <button type="button" onclick="confirmIndustryPicker()">确认</button>
+    </div>
+  </div>
+</div>
+
+<script src="/assets/app.js"></script>
+</body>
+</html>

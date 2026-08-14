@@ -1,4 +1,7 @@
 $ErrorActionPreference = "Stop"
+$utf8Output = [System.Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = $utf8Output
+$OutputEncoding = $utf8Output
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $root
@@ -55,15 +58,16 @@ if ($LASTEXITCODE -ne 0) {
     }
 }
 
-$appName = -join ([char[]](0x62DB, 0x8058, 0x8F6F, 0x4EF6, 0x52A9, 0x624B))
+$appName = -join ([char[]](0x62DB, 0x8058, 0x5DE5, 0x5177))
+$webData = "$(Join-Path $root 'src\recruit_assistant\web');recruit_assistant\web"
 
-# Single-file deliverable. Maimai is now a normal Python package, so no source folders need to be copied as data.
-& $python -m PyInstaller --noconfirm --clean --windowed --onefile --name RecruitAssistant --paths src --collect-all DrissionPage --collect-all webview --hidden-import DrissionPage --hidden-import psutil --hidden-import webview --hidden-import clr_loader --hidden-import pythonnet run.py
+# Single-file deliverable. The web console is bundled as static package data.
+& $python -m PyInstaller --noconfirm --clean --windowed --onefile --name RecruitTool --paths src --add-data $webData --collect-all DrissionPage --collect-all webview --hidden-import DrissionPage --hidden-import psutil --hidden-import webview --hidden-import clr_loader --hidden-import pythonnet run.py
 if ($LASTEXITCODE -ne 0) {
     throw "PyInstaller build failed."
 }
 
-$builtSingleExe = Join-Path $root "dist\RecruitAssistant.exe"
+$builtSingleExe = Join-Path $root "dist\RecruitTool.exe"
 $singleExe = Join-Path $root "dist\$appName.exe"
 if (Test-Path $singleExe) {
     Remove-Item -LiteralPath $singleExe -Force
@@ -74,7 +78,7 @@ if (-not (Test-Path $singleExe)) {
 }
 
 $buildDir = Join-Path $root "build"
-$specFile = Join-Path $root "RecruitAssistant.spec"
+$specFile = Join-Path $root "RecruitTool.spec"
 if (Test-Path $buildDir) {
     Remove-Item -LiteralPath $buildDir -Recurse -Force
 }

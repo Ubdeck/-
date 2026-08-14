@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import os
 import threading
 
 import webview
@@ -13,9 +14,26 @@ def main() -> None:
     server, url = start_server("127.0.0.1", port, open_browser=False)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+    shutdown_started = threading.Event()
+
+    def shutdown_app() -> None:
+        if shutdown_started.is_set():
+            return
+        shutdown_started.set()
+        STATE.task_stop_event.set()
+        STATE.stop_event.set()
+
+        def shutdown_server() -> None:
+            try:
+                server.shutdown()
+            finally:
+                server.server_close()
+
+        threading.Thread(target=shutdown_server, daemon=True).start()
+        threading.Timer(1.0, lambda: os._exit(0)).start()
 
     try:
-        webview.create_window(
+        window = webview.create_window(
             APP_NAME,
             url,
             width=1440,
@@ -23,11 +41,11 @@ def main() -> None:
             min_size=(1180, 760),
             text_select=True,
         )
+        window.events.closed += shutdown_app
         webview.start(debug=False)
     finally:
-        STATE.stop_event.set()
-        server.shutdown()
-        server.server_close()
+        shutdown_app()
+        os._exit(0)
 
 
 if __name__ == "__main__":

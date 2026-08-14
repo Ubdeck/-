@@ -1,5 +1,13 @@
 .venv/
+*.egg-info/
+.env
+.env.*
+!.env.example
 __pycache__/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 .playwright-mcp/
 build/
 dist/
@@ -7,11 +15,10 @@ dist/
 *.pid
 *.out
 *.err
+*.log
 edge_profile_*/
 runtime/
 backups/
-脉脉自动化/
-_legacy_maimai_auto/
 *.docx
 !docs/*.docx
 

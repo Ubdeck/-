@@ -4,15 +4,20 @@
 
 | 问题 | 首先检查 |
 | --- | --- |
-| 操作台按钮、任务配置、定时运行 | `src/recruit_assistant/app_backend.py` |
+| 操作台页面结构 | `src/recruit_assistant/web/index.html` |
+| 操作台样式 | `src/recruit_assistant/web/styles.css` |
+| 操作台按钮和前端状态 | `src/recruit_assistant/web/app.js` |
+| 任务配置、本地 API、定时运行 | `src/recruit_assistant/app_backend.py` |
 | 浏览器无法启动、登录不保留、端口异常 | `app_backend.py` 中的调试浏览器函数 |
-| 猎聘筛选、翻页、聊天页面行为 | `platforms/liepin/automation.py` |
-| 脉脉整轮流程顺序 | `platforms/maimai/bridge.py` |
-| 脉脉搜索条件 | `platforms/maimai/automation/search.py` |
-| 脉脉简历提取与翻页 | `platforms/maimai/automation/candidates.py` |
-| 脉脉 AI 筛选 | `platforms/maimai/matching.py` |
-| 脉脉沟通弹窗 | `platforms/maimai/automation/communication.py` |
-| 脉脉消息页交换手机 | `platforms/maimai/phone_exchange.py` |
+| 平台切换和渠道分发 | `app_backend.py` 中的 `PLATFORM_DEFS`、`normalize_config()` 和 `AppState.run_task()` |
+| 猎聘整轮流程 | `platforms/liepin/workflow.py` |
+| 猎聘职位管理页 | `platforms/liepin/job_manager.py` |
+| 猎聘候选人和简历 | `platforms/liepin/candidates.py` |
+| 猎聘 AI 匹配 | `platforms/liepin/ai_matcher.py` |
+| 猎聘搜索筛选控件 | `platforms/liepin/filters.py` |
+| 猎聘沟通和联系方式 | `platforms/liepin/communication.py` |
+| 脉脉主界面和流程骨架 | `platforms/maimai/automation.py` |
+| 脉脉浏览器连接 | `platforms/maimai/browser.py` |
 
 ## DrissionPage 修改原则
 
@@ -24,6 +29,13 @@
 
 ## 常用检查
 
+运行不连接真实招聘网站的单元测试：
+
+```powershell
+$env:PYTHONPATH = (Resolve-Path .\src).Path
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
+
 编译全部 Python 文件：
 
 ```powershell
@@ -32,24 +44,10 @@ $files += (Resolve-Path .\run.py).Path
 .\.venv\Scripts\python.exe -m py_compile @files
 ```
 
-检查脉脉模块能否导入：
-
-```powershell
-$env:PYTHONPATH = (Resolve-Path .\src).Path
-.\.venv\Scripts\python.exe -c "from recruit_assistant.platforms.maimai import bridge; print(bridge.maimai_options())"
-```
-
-检查 worker 入口。缺少参数时返回用法和退出码 2 是正常行为：
-
-```powershell
-$env:PYTHONPATH = (Resolve-Path .\src).Path
-.\.venv\Scripts\python.exe -m recruit_assistant.platforms.maimai.worker
-```
-
 ## 测试边界
 
-- 静态重构先做编译、导入和 worker 入口检查，不要自动向真实候选人发消息。
-- 页面流程测试先关闭“实际发送”，确认搜索、提取、AI 和翻页。
+- 静态重构先做编译和导入检查，不要自动向真实候选人发消息。
+- 页面流程测试先关闭自动沟通，确认当前渠道的打开、搜索、提取、AI 和翻页。
 - 必须验证真实发送时，限定职位、页数和候选人数，并观察每一步结果。
 - 不要为了清日志或删除锁定文件终止正在使用的 9225 浏览器。
 
@@ -57,7 +55,6 @@ $env:PYTHONPATH = (Resolve-Path .\src).Path
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\build_exe.ps1
-.\dist\招聘软件助手.exe --maimai-worker
 ```
 
-第二条命令应输出 worker 用法后退出，不应打开新的操作台。最终再从 EXE 正常启动一次，确认操作台和调试浏览器能打开。
+最终从 EXE 正常启动一次，确认操作台和调试浏览器能打开。
