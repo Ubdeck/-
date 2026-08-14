@@ -102,6 +102,8 @@ powershell -ExecutionPolicy Bypass -File .\build_exe.ps1
 
 软件会通过 GitHub Releases 检查最新版本。发布新版本时创建 `v0.1.1` 这类 tag，GitHub Actions 会自动构建 Windows exe 并上传到对应 Release；同事安装过一次带更新功能的版本后，可以在软件里点击“检查更新”完成下载、替换和重启。
 
+更新测试记录：`v0.1.2` 用于验证 GitHub Release 自动更新链路。
+
 ## 已知限制
 
 - 页面选择器依赖招聘平台当前 DOM，网站改版可能导致流程失效。
