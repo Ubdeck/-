@@ -520,23 +520,28 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
         before_tabs = set(self.page.tab_ids)
         if expected_name:
             self.wait_for_candidate_detail_name(expected_name, timeout=3.0)
-        button = self.click_current_candidate_immediate_communicate()
-        if button.get("status") == "already_communicated":
-            return {"status": "already_communicated", "message": button.get("message", "页面显示“沟通”，已跳过。")}
-        self.emit("maimai_communicate_send", f"正在填写招呼语并点击发送后继续沟通：{expected_name}" if greeting else f"正在点击发送后继续沟通：{expected_name}")
-        self.click_send_then_continue(greeting=greeting)
-        self.emit("maimai_communicate_send", "脉脉发送弹窗已关闭，正在等待消息页")
-        try:
-            chat_tab = self.wait_for_new_maimai_chat_tab(before_tabs, fallback_tab_id=before_tab_id)
-        except RuntimeError as exc:
-            send_state = self.inspect_maimai_communicate_send_state()
-            if send_state.get("sent"):
-                self.emit("maimai_communicate_send", "沟通已发送但消息页未自动打开，正在从当前候选人的沟通按钮进入消息页")
-                retry_before_tabs = set(self.page.tab_ids)
-                self.click_current_candidate_existing_communicate()
-                chat_tab = self.wait_for_new_maimai_chat_tab(retry_before_tabs, fallback_tab_id=before_tab_id)
-            else:
-                raise RuntimeError(f"{exc}；发送状态未确认：{send_state.get('message', '')}") from exc
+        button = self.click_current_candidate_immediate_communicate(expected_name=expected_name)
+        opened_existing_chat = button.get("status") == "already_communicated"
+        if opened_existing_chat:
+            self.emit("maimai_communicate_send", f"{button.get('message', '候选人已沟通过')} 正在进入消息页处理交换手机")
+            retry_before_tabs = set(self.page.tab_ids)
+            self.click_current_candidate_existing_communicate(expected_name=expected_name)
+            chat_tab = self.wait_for_new_maimai_chat_tab(retry_before_tabs, fallback_tab_id=before_tab_id)
+        else:
+            self.emit("maimai_communicate_send", f"正在填写招呼语并点击发送后继续沟通：{expected_name}" if greeting else f"正在点击发送后继续沟通：{expected_name}")
+            self.click_send_then_continue(greeting=greeting)
+            self.emit("maimai_communicate_send", "脉脉发送弹窗已关闭，正在等待消息页")
+            try:
+                chat_tab = self.wait_for_new_maimai_chat_tab(before_tabs, fallback_tab_id=before_tab_id)
+            except RuntimeError as exc:
+                send_state = self.inspect_maimai_communicate_send_state()
+                if send_state.get("sent"):
+                    self.emit("maimai_communicate_send", "沟通已发送但消息页未自动打开，正在从当前候选人的沟通按钮进入消息页")
+                    retry_before_tabs = set(self.page.tab_ids)
+                    self.click_current_candidate_existing_communicate(expected_name=expected_name)
+                    chat_tab = self.wait_for_new_maimai_chat_tab(retry_before_tabs, fallback_tab_id=before_tab_id)
+                else:
+                    raise RuntimeError(f"{exc}；发送状态未确认：{send_state.get('message', '')}") from exc
         phone_result = {"status": "unknown", "message": ""}
         try:
             self.emit("maimai_phone_request", "脉脉消息页已打开，正在等待会话加载")
@@ -544,20 +549,37 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
             self.emit("maimai_phone_request", "正在点击交换手机")
             phone_result = self.request_phone_in_maimai_chat(chat_tab)
             self.emit("maimai_phone_request", f"交换手机结果：{phone_result.get('status')}，{phone_result.get('message', '')}")
+            prefix = "已进入已沟通过候选人的消息页处理交换手机" if opened_existing_chat else "已发送沟通并进入消息页处理交换手机"
             return {
                 "status": "done",
-                "message": f"已发送沟通并进入消息页处理交换手机：{phone_result.get('message', '')}",
+                "message": f"{prefix}：{phone_result.get('message', '')}",
                 "phone": phone_result,
             }
         finally:
             self.close_maimai_chat_tab_and_return(chat_tab, before_tab_id)
 
-    def click_current_candidate_immediate_communicate(self, timeout: float = 8.0) -> dict:
+    def click_current_candidate_immediate_communicate(self, expected_name: str = "", timeout: float = 8.0) -> dict:
+        return self.click_current_candidate_communicate_button(
+            expected_name=expected_name,
+            mode="immediate",
+            timeout=timeout,
+        )
+
+    def click_current_candidate_existing_communicate(self, expected_name: str = "", timeout: float = 8.0) -> dict:
+        return self.click_current_candidate_communicate_button(
+            expected_name=expected_name,
+            mode="existing",
+            timeout=timeout,
+        )
+
+    def click_current_candidate_communicate_button(self, expected_name: str = "", mode: str = "immediate", timeout: float = 8.0) -> dict:
         deadline = time.time() + timeout
         last_result = None
         while time.time() < deadline:
             last_result = self.page.run_js(
                 """
+                const expectedName = String(arguments[0] || '').trim();
+                const mode = String(arguments[1] || 'immediate');
                 const visible = ele => {
                   const rect = ele.getBoundingClientRect();
                   const style = getComputedStyle(ele);
@@ -568,110 +590,92 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
                 };
                 const clean = value => String(value || '').replace(/\\s+/g, ' ').trim();
                 const textOf = ele => clean(ele.innerText || ele.textContent);
-                const detailScopes = Array.from(document.querySelectorAll('*'))
+                const actionTexts = mode === 'existing' ? ['沟通', '继续沟通'] : ['立即沟通', '沟通', '继续沟通'];
+                const exactActionText = text => actionTexts.includes(clean(text));
+                const roots = Array.from(document.querySelectorAll('.ant-drawer-open .ant-drawer-content, .ant-drawer-content, [class*=drawer], [class*=Drawer]'))
                   .filter(visible)
-                  .map(ele => ({ele, text: textOf(ele), rect: ele.getBoundingClientRect()}))
-                  .filter(item => item.rect.left > 1000
-                    && item.rect.width < 520
-                    && item.text.startsWith('觉得人才还不错，你可以')
-                    && item.text.includes('电话沟通')
-                    && (item.text.includes('立即沟通') || item.text.includes('沟通') || item.text.includes('继续沟通')))
-                  .sort((a, b) => {
-                    const area = item => item.rect.width * item.rect.height;
-                    return area(a) - area(b);
-                  })
-                  .map(item => item.ele);
-                const scopes = detailScopes;
-                if (!scopes.length) {
-                  return {ok: false, reason: 'candidate action scope not found'};
-                }
-                const buttons = scopes.flatMap(scope => Array.from(scope.querySelectorAll('.mui-btn, button, [role=button], a, div, span')))
-                  .filter(visible)
-                  .map(ele => ({target: ele, text: textOf(ele), rect: ele.getBoundingClientRect(), cls: String(ele.className || '')}))
-                  .filter(item => ['立即沟通', '沟通', '继续沟通'].includes(item.text))
-                  .sort((a, b) => {
-                    const rank = text => text === '立即沟通' ? 0 : (text === '沟通' ? 1 : 2);
-                    const ranked = rank(a.text) - rank(b.text);
-                    if (ranked !== 0) return ranked;
-                    const aBtn = a.cls.includes('mui-btn-primary') ? 0 : 1;
-                    const bBtn = b.cls.includes('mui-btn-primary') ? 0 : 1;
-                    if (aBtn !== bBtn) return aBtn - bBtn;
-                    return a.rect.left - b.rect.left;
+                  .filter(ele => {
+                    const text = textOf(ele);
+                    return (!expectedName || text.includes(expectedName))
+                      && actionTexts.some(action => text.includes(action));
                   });
-                const immediate = buttons.find(item => item.text === '立即沟通');
-                if (!immediate) {
-                  const already = buttons.find(item => item.text === '沟通' || item.text === '继续沟通');
-                  if (already) {
-                    return {ok: true, status: 'already_communicated', text: already.text, message: `页面按钮为“${already.text}”，说明此前已沟通过，跳过。`};
-                  }
-                  return {ok: false, reason: 'immediate communicate button not found', buttons: buttons.map(item => item.text)};
+                if (expectedName) {
+                  Array.from(document.querySelectorAll('*'))
+                    .filter(visible)
+                    .map(ele => ({ele, text: textOf(ele), rect: ele.getBoundingClientRect()}))
+                    .filter(item => item.text.includes(expectedName) && actionTexts.some(action => item.text.includes(action)))
+                    .sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height))
+                    .slice(0, 6)
+                    .forEach(item => roots.push(item.ele));
                 }
-                const button = immediate.target;
+                const contextHasName = ele => {
+                  if (!expectedName) return false;
+                  let node = ele;
+                  for (let depth = 0; node && depth < 8; depth += 1, node = node.parentElement) {
+                    if (textOf(node).includes(expectedName)) return true;
+                  }
+                  return false;
+                };
+                const inKnownRoot = ele => roots.some(root => root.contains(ele));
+                const buttons = Array.from(document.querySelectorAll('.mui-btn, button, [role=button], a, div, span'))
+                  .filter(visible)
+                  .map(ele => {
+                    const clickable = ele.closest('.mui-btn, button, [role=button], a') || ele;
+                    const ownText = textOf(ele);
+                    const clickText = textOf(clickable);
+                    const text = exactActionText(ownText) ? ownText : (exactActionText(clickText) ? clickText : '');
+                    const rect = clickable.getBoundingClientRect();
+                    const cls = String(clickable.className || '');
+                    const tag = String(clickable.tagName || '').toLowerCase();
+                    return {target: clickable, source: ele, text, rect, cls, tag};
+                  })
+                  .filter(item => exactActionText(item.text))
+                  .sort((a, b) => {
+                    const rank = item => {
+                      let score = 0;
+                      if (mode === 'immediate') {
+                        if (item.text === '立即沟通') score += 1000;
+                        if (item.text === '沟通' || item.text === '继续沟通') score += 700;
+                      } else {
+                        if (item.text === '沟通') score += 1000;
+                        if (item.text === '继续沟通') score += 950;
+                      }
+                      if (inKnownRoot(item.target)) score += 300;
+                      if (contextHasName(item.target)) score += 180;
+                      if (item.cls.includes('mui-btn-primary')) score += 50;
+                      if (item.cls.includes('mui-btn')) score += 35;
+                      if (item.tag === 'button' || item.tag === 'a') score += 20;
+                      score -= Math.min(item.rect.width * item.rect.height / 10000, 40);
+                      return score;
+                    };
+                    return rank(b) - rank(a) || a.rect.top - b.rect.top;
+                  });
+                const target = buttons[0];
+                if (!target) {
+                  return {ok: false, reason: mode === 'existing' ? 'existing communicate button not found' : 'communicate button not found', expected_name: expectedName, roots: roots.length};
+                }
+                if (mode === 'immediate' && target.text !== '立即沟通') {
+                  const already = target;
+                  if (already) {
+                    return {ok: true, status: 'already_communicated', text: already.text, message: `页面按钮为“${already.text}”，说明此前已沟通过。`};
+                  }
+                }
+                const button = target.target;
                 button.scrollIntoView({block: 'center', inline: 'nearest'});
                 for (const name of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
                   button.dispatchEvent(new MouseEvent(name, {bubbles: true, cancelable: true, composed: true, view: window}));
                 }
-                return {ok: true, status: 'clicked', text: immediate.text, class_name: immediate.cls};
-                """
+                return {ok: true, status: 'clicked', text: target.text, class_name: target.cls, expected_name: expectedName, roots: roots.length};
+                """,
+                expected_name,
+                mode,
             )
             if last_result and last_result.get("ok"):
                 return last_result
             self.check_stopped()
             time.sleep(0.3)
-        raise RuntimeError(f"脉脉立即沟通按钮处理失败：{last_result}")
-
-    def click_current_candidate_existing_communicate(self, timeout: float = 8.0) -> dict:
-        deadline = time.time() + timeout
-        last_result = None
-        while time.time() < deadline:
-            last_result = self.page.run_js(
-                """
-                const visible = ele => {
-                  const rect = ele.getBoundingClientRect();
-                  const style = getComputedStyle(ele);
-                  return rect.width > 0 && rect.height > 0
-                    && style.display !== 'none'
-                    && style.visibility !== 'hidden'
-                    && !ele.disabled;
-                };
-                const clean = value => String(value || '').replace(/\\s+/g, ' ').trim();
-                const textOf = ele => clean(ele.innerText || ele.textContent);
-                const detailScopes = Array.from(document.querySelectorAll('*'))
-                  .filter(visible)
-                  .map(ele => ({ele, text: textOf(ele), rect: ele.getBoundingClientRect()}))
-                  .filter(item => item.rect.left > 1000
-                    && item.rect.width < 520
-                    && item.text.startsWith('觉得人才还不错，你可以')
-                    && item.text.includes('电话沟通')
-                    && (item.text.includes('沟通') || item.text.includes('继续沟通')))
-                  .sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height))
-                  .map(item => item.ele);
-                const scopes = detailScopes;
-                if (!scopes.length) return {ok: false, reason: 'candidate action scope not found'};
-                const buttons = scopes.flatMap(scope => Array.from(scope.querySelectorAll('.mui-btn, button, [role=button], a, div, span')))
-                  .filter(visible)
-                  .map(ele => ({ele, text: textOf(ele), cls: String(ele.className || ''), rect: ele.getBoundingClientRect()}))
-                  .filter(item => item.text === '沟通' || item.text === '继续沟通')
-                  .sort((a, b) => {
-                    const aBtn = a.cls.includes('mui-btn') ? 0 : 1;
-                    const bBtn = b.cls.includes('mui-btn') ? 0 : 1;
-                    if (aBtn !== bBtn) return aBtn - bBtn;
-                    return a.rect.top - b.rect.top || a.rect.left - b.rect.left;
-                  });
-                const target = buttons[0];
-                if (!target) return {ok: false, reason: 'existing communicate button not found'};
-                target.ele.scrollIntoView({block: 'center', inline: 'nearest'});
-                for (const name of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
-                  target.ele.dispatchEvent(new MouseEvent(name, {bubbles: true, cancelable: true, composed: true, view: window}));
-                }
-                return {ok: true, status: 'clicked', text: target.text, class_name: target.cls};
-                """
-            )
-            if last_result and last_result.get("ok"):
-                return last_result
-            self.check_stopped()
-            time.sleep(0.3)
-        raise RuntimeError(f"脉脉沟通按钮打开消息页失败：{last_result}")
+        action = "沟通按钮打开消息页" if mode == "existing" else "立即沟通按钮处理"
+        raise RuntimeError(f"脉脉{action}失败：{last_result}")
 
     def click_send_then_continue(self, timeout: float = 10.0, greeting: str = "") -> dict:
         deadline = time.time() + timeout
@@ -900,7 +904,6 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
                   .find(Boolean) || '';
                 const activeText = Array.from(document.querySelectorAll('*'))
                   .filter(visible)
-                  .filter(ele => ele.getBoundingClientRect().left >= 300)
                   .map(textOf)
                   .filter(Boolean)
                   .join(' ');
@@ -956,7 +959,7 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
                     const rect = ele.getBoundingClientRect();
                     return {ele, text: textOf(ele), cls: String(ele.className || ''), rect};
                   })
-                  .filter(item => item.rect.left >= 300 && item.text === '交换手机')
+                  .filter(item => item.text === '交换手机')
                   .sort((a, b) => {
                     const aTool = a.cls.includes('tool normal') ? 0 : 1;
                     const bTool = b.cls.includes('tool normal') ? 0 : 1;
@@ -1002,7 +1005,6 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
                 const clean = value => String(value || '').replace(/\\s+/g, ' ').trim();
                 return Array.from(document.querySelectorAll('*'))
                   .filter(visible)
-                  .filter(ele => ele.getBoundingClientRect().left >= 300)
                   .map(ele => clean(ele.innerText || ele.textContent))
                   .filter(Boolean)
                   .join(' ');

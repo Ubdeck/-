@@ -5,7 +5,12 @@ import re
 import time
 from urllib import error, request
 
-from ...environment import get_env_value
+from ...model_config import (
+    DEFAULT_AI_PROVIDER,
+    DEFAULT_COMPANY_MODEL,
+    messages_for_endpoint,
+    resolve_model_endpoint,
+)
 from .browser import append_runtime_log
 from .constants import DEFAULT_MATCH_REQUIREMENTS, RUNTIME_DIR
 from .models import SearchFilters
@@ -16,10 +21,12 @@ class AiMatcherMixin:
         requirements = filters.match_requirements.strip() or DEFAULT_MATCH_REQUIREMENTS
 
         try:
-            decision = self.ask_deepseek_for_match(
+            decision = self.ask_model_for_match(
                 profile=profile,
                 requirements=requirements,
+                provider=filters.ai_provider,
                 api_key=filters.deepseek_api_key,
+                company_api_key=filters.company_model_api_key,
                 model=filters.deepseek_model,
             )
         except Exception as exc:
@@ -35,39 +42,43 @@ class AiMatcherMixin:
         profile["ai_match"] = decision
         return decision
 
-    def ask_deepseek_for_match(
+    def ask_model_for_match(
         self,
         profile: dict,
         requirements: str,
+        provider: str = DEFAULT_AI_PROVIDER,
         api_key: str = "",
-        model: str = "deepseek-chat",
+        company_api_key: str = "",
+        model: str = DEFAULT_COMPANY_MODEL,
     ) -> dict:
-        key = (api_key or get_env_value("DEEPSEEK_API_KEY") or "").strip()
-        if not key:
-            raise RuntimeError("请在UI填写 DeepSeek API Key，或设置环境变量 DEEPSEEK_API_KEY。")
+        endpoint = resolve_model_endpoint(provider, model, api_key, company_api_key)
+        if not endpoint.api_key:
+            raise RuntimeError(f"{endpoint.display_name} API Key 未配置。")
 
-        messages = self.build_match_messages(profile, requirements)
+        messages = messages_for_endpoint(self.build_match_messages(profile, requirements), endpoint)
         payload = {
-            "model": model.strip() or "deepseek-chat",
+            "model": endpoint.model,
             "messages": messages,
             "temperature": 0.1,
             "stream": False,
         }
+        if endpoint.use_json_response_format:
+            payload["response_format"] = {"type": "json_object"}
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         req = request.Request(
-            "https://api.deepseek.com/chat/completions",
+            endpoint.chat_completions_url,
             data=data,
             headers={
-                "Authorization": f"Bearer {key}",
+                "Authorization": f"Bearer {endpoint.api_key}",
                 "Content-Type": "application/json",
                 "Connection": "close",
             },
             method="POST",
         )
-        body = self.urlopen_with_retry(req, retries=5, timeout=60)
+        body = self.urlopen_with_retry(req, retries=5, timeout=60, provider_name=endpoint.display_name)
 
         result = json.loads(body)
-        content = result["choices"][0]["message"]["content"]
+        content = self.extract_chat_content(result)
         decision = self.parse_ai_json(content)
         decision.setdefault("match", False)
         decision.setdefault("score", 0)
@@ -78,7 +89,13 @@ class AiMatcherMixin:
         self.append_ai_match_log(profile, requirements, payload, decision)
         return decision
 
-    def urlopen_with_retry(self, req: request.Request, retries: int = 5, timeout: int = 60) -> str:
+    def urlopen_with_retry(
+        self,
+        req: request.Request,
+        retries: int = 5,
+        timeout: int = 60,
+        provider_name: str = "AI 模型",
+    ) -> str:
         last_error = None
         for attempt in range(1, retries + 1):
             try:
@@ -90,19 +107,19 @@ class AiMatcherMixin:
             except error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace")
                 if exc.code not in {408, 409, 425, 429, 500, 502, 503, 504}:
-                    raise RuntimeError(f"DeepSeek API 请求失败：HTTP {exc.code} {detail}") from exc
-                last_error = RuntimeError(f"DeepSeek API 请求失败：HTTP {exc.code} {detail}")
+                    raise RuntimeError(f"{provider_name} API 请求失败：HTTP {exc.code} {detail}") from exc
+                last_error = RuntimeError(f"{provider_name} API 请求失败：HTTP {exc.code} {detail}")
             except error.URLError as exc:
-                last_error = RuntimeError(f"DeepSeek API 请求失败：{exc}")
+                last_error = RuntimeError(f"{provider_name} API 请求失败：{exc}")
             except OSError as exc:
-                last_error = RuntimeError(f"DeepSeek API 请求失败：{exc}")
+                last_error = RuntimeError(f"{provider_name} API 请求失败：{exc}")
 
             if attempt < retries:
                 delay = min(2 ** attempt, 20)
-                append_runtime_log(f"DeepSeek retry attempt={attempt} delay={delay}s error={last_error}")
+                append_runtime_log(f"{provider_name} retry attempt={attempt} delay={delay}s error={last_error}")
                 time.sleep(delay)
 
-        raise last_error or RuntimeError("DeepSeek API 请求失败：unknown error")
+        raise last_error or RuntimeError(f"{provider_name} API 请求失败：unknown error")
 
     def append_ai_match_log(self, profile: dict, requirements: str, payload: dict, decision: dict) -> None:
         output_path = RUNTIME_DIR / "ai_match_logs.json"
@@ -206,7 +223,7 @@ class AiMatcherMixin:
 
     @staticmethod
     def parse_ai_json(content: str) -> dict:
-        text = str(content or "").strip()
+        text = re.sub(r"<think>.*?</think>", "", str(content or ""), flags=re.I | re.S).strip()
         if text.startswith("```"):
             text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
             text = re.sub(r"\s*```$", "", text)
@@ -217,3 +234,18 @@ class AiMatcherMixin:
             if not match:
                 raise RuntimeError(f"AI没有返回可解析JSON：{content}")
             return json.loads(match.group(0))
+
+    @staticmethod
+    def extract_chat_content(response: dict) -> str:
+        try:
+            content = response["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise RuntimeError("AI 模型返回中缺少 choices[0].message.content。") from exc
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "".join(
+                str(part.get("text", "")) if isinstance(part, dict) else str(part)
+                for part in content
+            )
+        return str(content or "")

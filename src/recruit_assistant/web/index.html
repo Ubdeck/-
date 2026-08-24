@@ -145,8 +145,16 @@
       <section class="card span-6">
         <h3>AI 匹配与自动沟通</h3>
         <div class="fields">
-          <div class="field full"><label>DeepSeek Key</label><input id="deepseek_api_key" type="password" /></div>
-          <div><label>模型</label><input id="deepseek_model" /></div>
+          <div>
+            <label>AI 通道</label>
+            <select id="ai_provider" onchange="applyAiProviderUI(true)">
+              <option value="company">公司模型</option>
+              <option value="deepseek">DeepSeek</option>
+            </select>
+          </div>
+          <div><label id="aiModelLabel">公司模型</label><input id="deepseek_model" /></div>
+          <div id="companyModelKeyPanel" class="field full platform-panel"><label>公司模型 Key</label><input id="company_model_api_key" type="password" /></div>
+          <div id="deepseekKeyPanel" class="field full platform-panel hidden"><label>DeepSeek Key</label><input id="deepseek_api_key" type="password" /></div>
           <div id="liepinAiPanel" class="field full platform-panel">
             <div class="fields">
               <div><label>处理人数</label><input id="candidate_limit" type="number" min="1" /></div>
@@ -165,7 +173,7 @@
           <div id="aiRequirementPanel" class="field full platform-panel">
             <label>AI筛选要求</label>
             <textarea id="match_requirements" placeholder="例如：要有销售经验，最好做过医疗行业，成都优先，薪资别太离谱。留空则使用默认通用要求。"></textarea>
-            <div class="hint">写口语化要求即可，后台会把它整理成判断标准发给 AI。猎聘和脉脉都会用这套要求；留空时使用默认通用要求。</div>
+            <div class="hint"></div>
           </div>
         </div>
       </section>

@@ -77,8 +77,10 @@ def main() -> None:
     parser.add_argument("--job-ai", action="store_true")
     parser.add_argument("--company-ai", action="store_true")
     parser.add_argument("--match-requirements", default="")
+    parser.add_argument("--ai-provider", choices=("company", "deepseek"), default="company")
     parser.add_argument("--deepseek-api-key", default="")
-    parser.add_argument("--deepseek-model", default="deepseek-chat")
+    parser.add_argument("--company-model-api-key", default="")
+    parser.add_argument("--deepseek-model", default="")
     parser.add_argument("--no-auto-communicate", action="store_true")
     parser.add_argument("--candidate-limit", type=int, default=1)
     args = parser.parse_args()
@@ -88,7 +90,9 @@ def main() -> None:
     search_page.apply_filters(
         SearchFilters(
             match_requirements=args.match_requirements.strip(),
+            ai_provider=args.ai_provider,
             deepseek_api_key=args.deepseek_api_key.strip(),
+            company_model_api_key=args.company_model_api_key.strip(),
             deepseek_model=args.deepseek_model.strip(),
             auto_communicate=not args.no_auto_communicate,
             candidate_limit=args.candidate_limit,

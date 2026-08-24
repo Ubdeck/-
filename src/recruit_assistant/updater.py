@@ -173,74 +173,146 @@ def powershell_executable() -> str:
     return str(candidate if candidate.exists() else "powershell.exe")
 
 
-def cmd_executable() -> str:
+def wscript_executable() -> str:
     system_root = Path(os.environ.get("SystemRoot") or r"C:\Windows")
-    candidate = system_root / "System32" / "cmd.exe"
-    return str(candidate if candidate.exists() else "cmd.exe")
+    candidate = system_root / "System32" / "wscript.exe"
+    return str(candidate if candidate.exists() else "wscript.exe")
+
+
+def vbs_string(value: str) -> str:
+    return '"' + str(value).replace('"', '""') + '"'
 
 
 def launch_update_installer_and_exit(downloaded_exe: Path, app_name: str) -> None:
     target_exe = current_executable()
     if target_exe is None:
         raise RuntimeError("当前是源码运行模式，只有打包后的 exe 支持一键安装更新。")
-    script = downloaded_exe.parent / "install_update.cmd"
+    script = downloaded_exe.parent / "install_update.ps1"
+    launcher = downloaded_exe.parent / "install_update.vbs"
     log_path = downloaded_exe.parent / "install_update.log"
-    script.write_text(
-        """
-@echo off
-setlocal
-set "TARGET_PID=%~1"
-set "SOURCE_EXE=%~2"
-set "TARGET_EXE=%~3"
-set "LOG_PATH=%~4"
-echo %date% %time% installer start pid=%TARGET_PID% source=%SOURCE_EXE% target=%TARGET_EXE% >> "%LOG_PATH%"
-:wait_process
-tasklist /FI "PID eq %TARGET_PID%" | findstr /R /C:"%TARGET_PID%" >nul
-if not errorlevel 1 (
-  timeout /t 1 /nobreak >nul
-  goto wait_process
-)
-timeout /t 1 /nobreak >nul
-if exist "%TARGET_EXE%" (
-  copy /Y "%TARGET_EXE%" "%TARGET_EXE%.bak" >> "%LOG_PATH%" 2>&1
-)
-set "COPIED=0"
-for /L %%I in (1,1,30) do (
-  copy /Y "%SOURCE_EXE%" "%TARGET_EXE%" >> "%LOG_PATH%" 2>&1
-  if not errorlevel 1 (
-    set "COPIED=1"
-    echo %date% %time% copy success attempt %%I >> "%LOG_PATH%"
-    goto copied
-  )
-  echo %date% %time% copy failed attempt %%I >> "%LOG_PATH%"
-  timeout /t 1 /nobreak >nul
-)
-:copied
-if "%COPIED%" NEQ "1" (
-  echo %date% %time% ERROR copy failed after retries >> "%LOG_PATH%"
-  exit /b 1
-)
-start "" "%TARGET_EXE%"
-echo %date% %time% restarted updated app >> "%LOG_PATH%"
-exit /b 0
-""".strip(),
+    log_path.write_text(
+        f"{time.strftime('%Y-%m-%d %H:%M:%S')} launcher prepared source={downloaded_exe} target={target_exe}\n",
         encoding="utf-8",
     )
-    creationflags = 0
-    if os.name == "nt":
-        creationflags = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
-    subprocess.Popen(
-        [
-            cmd_executable(),
-            "/c",
-            str(script),
-            str(os.getpid()),
-            str(downloaded_exe),
-            str(target_exe),
-            str(log_path),
-        ],
-        cwd=str(target_exe.parent),
-        creationflags=creationflags,
+    script.write_text(
+        '''
+param(
+  [int]$TargetPid,
+  [string]$SourceExe,
+  [string]$TargetExe,
+  [string]$LogPath
+)
+
+$ErrorActionPreference = "Continue"
+
+function Write-InstallLog {
+  param([string]$Message)
+  $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff') $Message"
+  Add-Content -LiteralPath $LogPath -Encoding UTF8 -Value $line
+}
+
+function Get-TargetProcesses {
+  param([string]$TargetPath)
+  $targetFullPath = [System.IO.Path]::GetFullPath($TargetPath)
+  @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
+    try {
+      $_.Id -ne $PID -and $_.Path -and ([System.IO.Path]::GetFullPath($_.Path) -ieq $targetFullPath)
+    } catch {
+      $false
+    }
+  })
+}
+
+Write-InstallLog "installer start pid=$TargetPid source=$SourceExe target=$TargetExe"
+Start-Sleep -Milliseconds 800
+
+$deadline = (Get-Date).AddSeconds(20)
+do {
+  $blocking = Get-TargetProcesses -TargetPath $TargetExe
+  if ($blocking.Count -eq 0) {
+    break
+  }
+  Write-InstallLog ("waiting target processes: " + (($blocking | ForEach-Object { $_.Id }) -join ","))
+  Start-Sleep -Milliseconds 500
+} while ((Get-Date) -lt $deadline)
+
+$blocking = Get-TargetProcesses -TargetPath $TargetExe
+if ($blocking.Count -gt 0) {
+  Write-InstallLog ("force stopping target processes: " + (($blocking | ForEach-Object { $_.Id }) -join ","))
+  foreach ($proc in $blocking) {
+    try {
+      Stop-Process -Id $proc.Id -Force -ErrorAction Stop
+    } catch {
+      Write-InstallLog "force stop failed pid=$($proc.Id): $($_.Exception.Message)"
+    }
+  }
+  Start-Sleep -Milliseconds 800
+}
+
+try {
+  if (Test-Path -LiteralPath $TargetExe) {
+    Copy-Item -LiteralPath $TargetExe -Destination "$TargetExe.bak" -Force -ErrorAction Stop
+    Write-InstallLog "backup success"
+  }
+} catch {
+  Write-InstallLog "backup failed: $($_.Exception.Message)"
+}
+
+$copied = $false
+for ($i = 1; $i -le 40; $i++) {
+  try {
+    Copy-Item -LiteralPath $SourceExe -Destination $TargetExe -Force -ErrorAction Stop
+    Write-InstallLog "copy success attempt $i"
+    $copied = $true
+    break
+  } catch {
+    Write-InstallLog "copy failed attempt ${i}: $($_.Exception.Message)"
+    Start-Sleep -Milliseconds 500
+  }
+}
+
+if (-not $copied) {
+  Write-InstallLog "ERROR copy failed after retries"
+  exit 1
+}
+
+try {
+  Write-InstallLog "update installed; user should restart app manually"
+  exit 0
+} catch {
+  Write-InstallLog "ERROR finalizing update failed: $($_.Exception.Message)"
+  exit 1
+}
+'''.strip(),
+        encoding="utf-8",
     )
+    command = " ".join(
+        [
+            vbs_string(powershell_executable()),
+            "-NoProfile",
+            "-ExecutionPolicy Bypass",
+            "-WindowStyle Hidden",
+            "-File",
+            vbs_string(str(script)),
+            vbs_string(str(os.getpid())),
+            vbs_string(str(downloaded_exe)),
+            vbs_string(str(target_exe)),
+            vbs_string(str(log_path)),
+        ]
+    )
+    launcher.write_text(
+        "\n".join(
+            [
+                'Set shell = CreateObject("WScript.Shell")',
+                f"shell.CurrentDirectory = {vbs_string(str(target_exe.parent))}",
+                f"shell.Run {vbs_string(command)}, 0, False",
+            ]
+        ),
+        encoding="utf-16",
+    )
+    if os.name == "nt":
+        os.startfile(str(launcher))  # type: ignore[attr-defined]
+    else:
+        subprocess.Popen([powershell_executable(), "-File", str(script)], cwd=str(target_exe.parent))
     time.sleep(1.0)
     os._exit(0)

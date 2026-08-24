@@ -7,7 +7,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from recruit_assistant.environment import parse_env_file
-from recruit_assistant.app_backend import normalize_config, normalize_platform, platform_home_url
+from recruit_assistant.app_backend import normalize_company_model, normalize_config, normalize_platform, platform_home_url
+from recruit_assistant.model_config import messages_for_endpoint, resolve_model_endpoint
 from recruit_assistant.platforms.liepin.ai_matcher import AiMatcherMixin
 from recruit_assistant.platforms.liepin.browser import same_site_url
 from recruit_assistant.platforms.liepin.constants import DEFAULT_MATCH_REQUIREMENTS, RUNTIME_DIR
@@ -36,6 +37,41 @@ class LiepinCoreTests(unittest.TestCase):
         self.assertEqual(normalize_platform("liepin"), "liepin")
         self.assertEqual(normalize_platform("maimai"), "maimai")
         self.assertEqual(normalize_platform("unknown"), "liepin")
+
+    def test_old_deepseek_model_config_keeps_deepseek_provider(self) -> None:
+        self.assertEqual(normalize_company_model("deepseek-chat"), "minimax")
+        config = normalize_config({"deepseek_model": "deepseek-chat"})
+        self.assertEqual(config["ai_provider"], "deepseek")
+        self.assertEqual(config["deepseek_model"], "deepseek-chat")
+
+    def test_ai_provider_selects_separate_endpoints_and_defaults(self) -> None:
+        company = resolve_model_endpoint("company", "", company_api_key="company-key")
+        deepseek = resolve_model_endpoint("deepseek", "", deepseek_api_key="deepseek-key")
+        self.assertEqual(company.model, "minimax")
+        self.assertTrue(company.chat_completions_url.endswith("/v1/chat/completions"))
+        self.assertTrue(company.use_json_response_format)
+        self.assertEqual(deepseek.model, "deepseek-chat")
+        self.assertEqual(deepseek.chat_completions_url, "https://api.deepseek.com/chat/completions")
+        self.assertFalse(deepseek.use_json_response_format)
+
+    def test_ai_provider_keeps_separate_local_keys(self) -> None:
+        config = normalize_config(
+            {
+                "ai_provider": "company",
+                "company_model_api_key": "company-key",
+                "deepseek_api_key": "deepseek-key",
+            }
+        )
+        self.assertEqual(config["company_model_api_key"], "company-key")
+        self.assertEqual(config["deepseek_api_key"], "deepseek-key")
+
+    def test_company_only_adds_output_consistency_instruction(self) -> None:
+        messages = [{"role": "system", "content": "base"}, {"role": "user", "content": "request"}]
+        company = resolve_model_endpoint("company", company_api_key="company-key")
+        deepseek = resolve_model_endpoint("deepseek", deepseek_api_key="deepseek-key")
+        self.assertIn("字段必须相互一致", messages_for_endpoint(messages, company)[0]["content"])
+        self.assertEqual(messages_for_endpoint(messages, deepseek), messages)
+        self.assertEqual(messages[0]["content"], "base")
 
     def test_maimai_default_filters_are_available(self) -> None:
         config = normalize_config({"platform": "maimai"})
@@ -103,6 +139,15 @@ class LiepinCoreTests(unittest.TestCase):
         payload = {"match": True, "score": 88}
         content = "```json\n" + json.dumps(payload) + "\n```"
         self.assertEqual(AiMatcherMixin.parse_ai_json(content), payload)
+
+    def test_ai_json_parser_ignores_company_model_thinking_block(self) -> None:
+        payload = {"match": True, "score": 88}
+        content = "<think>内部推理，不属于最终 JSON</think>\n" + json.dumps(payload)
+        self.assertEqual(AiMatcherMixin.parse_ai_json(content), payload)
+
+    def test_company_model_response_uses_openai_chat_shape(self) -> None:
+        response = {"choices": [{"message": {"content": '{"match":false}'}}]}
+        self.assertEqual(AiMatcherMixin.extract_chat_content(response), '{"match":false}')
 
     def test_env_file_parser_handles_comments_and_quotes(self) -> None:
         with TemporaryDirectory() as directory:

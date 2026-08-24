@@ -29,13 +29,23 @@ if __package__ in (None, ""):
     package_root = Path(__file__).resolve().parents[1]
     if str(package_root) not in sys.path:
         sys.path.insert(0, str(package_root))
-    from recruit_assistant.environment import get_env_value
+    from recruit_assistant.model_config import (
+        DEFAULT_AI_PROVIDER,
+        DEFAULT_COMPANY_MODEL,
+        normalize_ai_provider,
+        normalize_model_for_provider,
+    )
     from recruit_assistant.platforms.liepin import DEFAULT_MATCH_REQUIREMENTS, SEARCH_URL as LIEPIN_SEARCH_URL, LiepinSearchPage, SearchFilters
     from recruit_assistant.platforms.maimai import DEFAULT_MAIMAI_GREETING, MAIMAI_TALENTS_URL, MaimaiRecruitPage
     from recruit_assistant.updater import check_for_update, download_update, launch_update_installer_and_exit
     from recruit_assistant.version import APP_VERSION
 else:
-    from .environment import get_env_value
+    from .model_config import (
+        DEFAULT_AI_PROVIDER,
+        DEFAULT_COMPANY_MODEL,
+        normalize_ai_provider,
+        normalize_model_for_provider,
+    )
     from .platforms.liepin import DEFAULT_MATCH_REQUIREMENTS, SEARCH_URL as LIEPIN_SEARCH_URL, LiepinSearchPage, SearchFilters
     from .platforms.maimai import DEFAULT_MAIMAI_GREETING, MAIMAI_TALENTS_URL, MaimaiRecruitPage
     from .updater import check_for_update, download_update, launch_update_installer_and_exit
@@ -583,8 +593,10 @@ def default_filter_config() -> dict:
         "use_keywords_ai_words": False,
         "use_job_ai_words": False,
         "use_company_ai_words": False,
-        "deepseek_api_key": get_env_value("DEEPSEEK_API_KEY"),
-        "deepseek_model": "deepseek-chat",
+        "ai_provider": DEFAULT_AI_PROVIDER,
+        "deepseek_api_key": "",
+        "company_model_api_key": "",
+        "deepseek_model": DEFAULT_COMPANY_MODEL,
         "match_requirements": DEFAULT_REQUIREMENTS,
         "auto_communicate": True,
         "request_resume_after_communicate": True,
@@ -640,8 +652,14 @@ class AppState:
         merged_defaults = defaults | data.get("defaults", {})
         if not merged_defaults.get("match_requirements"):
             merged_defaults["match_requirements"] = DEFAULT_REQUIREMENTS
-        if not merged_defaults.get("deepseek_model"):
-            merged_defaults["deepseek_model"] = "deepseek-chat"
+        merged_defaults["ai_provider"] = normalize_ai_provider(
+            (data.get("defaults") or {}).get("ai_provider"),
+            merged_defaults.get("deepseek_model"),
+        )
+        merged_defaults["deepseek_model"] = normalize_model_for_provider(
+            merged_defaults["ai_provider"],
+            merged_defaults.get("deepseek_model"),
+        )
         data["defaults"] = merged_defaults
         tasks = data.get("tasks") or []
         if not tasks:
@@ -739,8 +757,8 @@ class AppState:
                 APP_DIR,
                 progress_callback=on_progress,
             )
-            self.set_update_status(phase="installing", message="下载完成，正在退出并安装更新", percent=100)
-            self.add_log("更新已下载，软件即将退出并安装新版本。")
+            self.set_update_status(phase="installing", message="下载完成，正在退出并安装更新；完成后请手动重新打开软件", percent=100)
+            self.add_log("更新已下载，软件即将退出并安装新版本；完成后请手动重新打开软件。")
 
             def run_installer() -> None:
                 try:
@@ -812,7 +830,9 @@ class AppState:
             defaults = self.data.get("defaults", {}).copy()
             for key in (
                 "platform",
+                "ai_provider",
                 "deepseek_api_key",
+                "company_model_api_key",
                 "deepseek_model",
                 "match_requirements",
                 "maimai_page_limit",
@@ -1036,9 +1056,21 @@ def normalize_times(values: list | str) -> list[str]:
     return sorted(result)
 
 
+def normalize_company_model(value) -> str:
+    return normalize_model_for_provider("company", str(value or ""))
+
+
 def normalize_config(config: dict) -> dict:
     base = default_filter_config()
     base.update(config or {})
+    base["ai_provider"] = normalize_ai_provider(
+        (config or {}).get("ai_provider"),
+        base.get("deepseek_model"),
+    )
+    base["deepseek_model"] = normalize_model_for_provider(
+        base["ai_provider"],
+        base.get("deepseek_model"),
+    )
     base["platform"] = normalize_platform(base.get("platform"))
     try:
         base["port"] = int(base.get("port") or DEFAULT_BROWSER_PORT)
@@ -1096,8 +1128,10 @@ def build_filters(config: dict) -> tuple[SearchFilters, int]:
     filters = SearchFilters(
         selected_chat_job=cfg.get("selected_chat_job"),
         match_requirements=str(cfg.get("match_requirements") or "").strip(),
+        ai_provider=str(cfg.get("ai_provider") or DEFAULT_AI_PROVIDER).strip(),
         deepseek_api_key=str(cfg.get("deepseek_api_key") or "").strip(),
-        deepseek_model=str(cfg.get("deepseek_model") or "deepseek-chat").strip(),
+        company_model_api_key=str(cfg.get("company_model_api_key") or "").strip(),
+        deepseek_model=str(cfg.get("deepseek_model") or DEFAULT_COMPANY_MODEL).strip(),
         auto_communicate=bool(cfg.get("auto_communicate")),
         request_resume_after_communicate=bool(cfg.get("request_resume_after_communicate")),
         request_phone_after_communicate=bool(cfg.get("request_phone_after_communicate")),

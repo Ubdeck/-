@@ -7,8 +7,10 @@ from dataclasses import dataclass
 class SearchFilters:
     selected_chat_job: dict | None = None
     match_requirements: str = ""
+    ai_provider: str = "company"
     deepseek_api_key: str = ""
-    deepseek_model: str = "deepseek-chat"
+    company_model_api_key: str = ""
+    deepseek_model: str = "minimax"
     auto_communicate: bool = True
     request_resume_after_communicate: bool = True
     request_phone_after_communicate: bool = False

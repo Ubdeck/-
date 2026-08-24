@@ -1,6 +1,6 @@
 # 招聘工具
 
-一个面向 Windows 的多渠道招聘自动化桌面工具，通过 DrissionPage 接管本机已登录的 Chromium 浏览器。桌面界面由 `pywebview` 承载，当前支持猎聘已跑通流程，并开始接入脉脉招聘渠道；DeepSeek 用于候选人匹配判断。
+一个面向 Windows 的多渠道招聘自动化桌面工具，通过 DrissionPage 接管本机已登录的 Chromium 浏览器。桌面界面由 `pywebview` 承载，当前支持猎聘已跑通流程，并开始接入脉脉招聘渠道；DeepSeek 或公司模型用于候选人匹配判断。
 
 > 项目目前处于 Alpha 阶段。它依赖招聘网站的页面结构，不使用平台官方 API；网站改版后可能需要更新选择器。真实发送会对候选人产生实际影响，开发和验证时请保持测试模式。
 
@@ -8,7 +8,7 @@
 
 - 保存多套招聘任务，在猎聘和脉脉等渠道之间切换，并按多个时间点运行。
 - 自动填写关键词、城市、学历、经历、行业和职能等筛选条件。
-- 提取候选人简历，使用 DeepSeek 按招聘要求判断匹配度。
+- 提取候选人简历，可按任务选择 DeepSeek 或公司 OpenAI 兼容模型判断匹配度。
 - 对匹配候选人发起沟通，并按平台能力索要简历或手机号。
 - 在桌面操作台查看执行日志、AI 结论和沟通状态。
 - 使用固定浏览器资料目录保留登录状态。
@@ -19,7 +19,7 @@
 - Python 3.10 或更高版本
 - Microsoft Edge 或兼容 Chromium 浏览器
 - 有效的招聘平台账号（猎聘、脉脉等）
-- DeepSeek API Key
+- DeepSeek 或公司模型 API Key
 
 ## 快速开始
 
@@ -40,9 +40,12 @@ py -3 -m venv .venv
 
 ## API 配置
 
-可以在操作台本地填写 DeepSeek Key，也可以从 [.env.example](.env.example) 创建 `runtime/.env`：
+操作台可为每个任务选择 `DeepSeek` 或 `公司模型`，并分别保存对应 Key。也可以在 `runtime/.env` 中配置默认凭据和接口：
 
 ```dotenv
+COMPANY_MODEL_API_KEY=your-key
+COMPANY_MODEL_BASE_URL=http://172.20.13.3:9094/v1
+COMPANY_MODEL=minimax
 DEEPSEEK_API_KEY=your-key
 DEEPSEEK_BASE_URL=https://api.deepseek.com
 DEEPSEEK_MODEL=deepseek-chat
@@ -64,7 +67,7 @@ src/recruit_assistant/
       browser.py              # CDP 浏览器连接
       job_manager.py          # 职位管理页
       candidates.py           # 候选人列表和简历提取
-      ai_matcher.py           # DeepSeek 匹配
+      ai_matcher.py           # DeepSeek / 公司模型匹配
       communication.py        # 沟通及联系方式请求
       filters.py              # 搜索筛选控件
       models.py               # 配置和进度模型

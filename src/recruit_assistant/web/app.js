@@ -18,7 +18,8 @@ const fieldIds = [
   "maimai_company", "maimai_gender", "maimai_age_min", "maimai_age_max", "maimai_greeting",
   "experience", "recruitment_type", "active_status", "job_status",
   "job_hop_frequency", "age_min", "age_max", "gender_requirement", "language_requirement",
-  "graduation_year", "deepseek_api_key", "deepseek_model", "candidate_limit", "maimai_page_limit", "maimai_auto_communicate", "match_requirements",
+  "graduation_year", "ai_provider", "deepseek_api_key", "company_model_api_key", "deepseek_model",
+  "candidate_limit", "maimai_page_limit", "maimai_auto_communicate", "match_requirements",
   "use_keywords_ai_words", "use_job_ai_words", "use_company_ai_words", "auto_communicate",
   "request_resume_after_communicate", "request_phone_after_communicate"
 ];
@@ -111,6 +112,22 @@ function applyPlatformUI() {
   setPanelVisible("maimaiAiPanel", platform === "maimai");
   setPanelVisible("maimaiPanel", platform === "maimai");
   document.getElementById("pageTitle").textContent = (activeTask()?.name || "自动搜索与沟通") + ` · ${meta.name}`;
+  applyAiProviderUI(false);
+}
+function applyAiProviderUI(resetModel = false) {
+  const provider = document.getElementById("ai_provider")?.value || "company";
+  const model = document.getElementById("deepseek_model");
+  const useCompany = provider === "company";
+  setPanelVisible("companyModelKeyPanel", useCompany);
+  setPanelVisible("deepseekKeyPanel", !useCompany);
+  const label = document.getElementById("aiModelLabel");
+  if (label) label.textContent = useCompany ? "公司模型" : "DeepSeek 模型";
+  if (!model) return;
+  if (resetModel) {
+    model.value = useCompany ? "minimax" : "deepseek-chat";
+  } else if (!model.value || (useCompany && model.value.startsWith("deepseek-")) || (!useCompany && model.value === "minimax")) {
+    model.value = useCompany ? "minimax" : "deepseek-chat";
+  }
 }
 function renderJobSelect(cfg = null) {
   const jobSelect = document.getElementById("selected_chat_job");

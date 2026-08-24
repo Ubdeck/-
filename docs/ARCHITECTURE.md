@@ -39,7 +39,7 @@ run.py
 | `workflow.py` | 填写条件、处理候选人和汇总整轮结果 |
 | `job_manager.py` | 职位管理页、分页和职位卡片提取 |
 | `candidates.py` | 候选人切换、等待和简历提取 |
-| `ai_matcher.py` | DeepSeek 请求、提示词、解析和日志 |
+| `ai_matcher.py` | DeepSeek / 公司 OpenAI 兼容模型请求、提示词、解析和日志 |
 | `communication.py` | 立即沟通、职位选择、聊天及联系方式请求 |
 | `filters.py` | 城市、行业、职能和下拉筛选控件 |
 | `browser.py` | CDP 连接和浏览器就绪检查 |

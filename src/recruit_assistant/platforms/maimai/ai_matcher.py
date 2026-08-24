@@ -5,7 +5,7 @@ import re
 import time
 from urllib import error, request
 
-from ...environment import get_env_value
+from ...model_config import messages_for_endpoint, resolve_model_endpoint
 from .browser import append_runtime_log
 from .constants import DEFAULT_MAIMAI_MATCH_REQUIREMENTS, RUNTIME_DIR
 
@@ -13,33 +13,40 @@ from .constants import DEFAULT_MAIMAI_MATCH_REQUIREMENTS, RUNTIME_DIR
 class MaimaiAiMatcherMixin:
     def analyze_current_page_candidates(self, results: list[dict], config: dict) -> dict:
         requirements = self.clean_config_value(config.get("match_requirements")) or DEFAULT_MAIMAI_MATCH_REQUIREMENTS
-        api_key = self.clean_config_value(config.get("deepseek_api_key")) or get_env_value("DEEPSEEK_API_KEY")
-        model = self.clean_config_value(config.get("deepseek_model")) or "deepseek-chat"
+        endpoint = resolve_model_endpoint(
+            self.clean_config_value(config.get("ai_provider")),
+            self.clean_config_value(config.get("deepseek_model")),
+            self.clean_config_value(config.get("deepseek_api_key")),
+            self.clean_config_value(config.get("company_model_api_key")),
+        )
 
         if not results:
             summary = {"processed": 0, "matched": 0, "results": []}
             self.save_batch_summary(summary["results"], summary)
             return summary
 
-        self.emit("maimai_ai_start", f"正在把本页 {len(results)} 人一次性发给 DeepSeek")
-        if not api_key:
-            raise RuntimeError("请在UI填写 DeepSeek API Key，或设置环境变量 DEEPSEEK_API_KEY。")
+        self.emit("maimai_ai_start", f"正在把本页 {len(results)} 人一次性发给{endpoint.display_name}")
+        if not endpoint.api_key:
+            raise RuntimeError(f"{endpoint.display_name} API Key 未配置。")
 
         candidates = [self.build_candidate_payload(item) for item in results]
+        messages = messages_for_endpoint(self.build_match_messages(candidates, requirements), endpoint)
         payload = {
-            "model": model.strip() or "deepseek-chat",
-            "messages": self.build_match_messages(candidates, requirements),
+            "model": endpoint.model,
+            "messages": messages,
             "temperature": 0.1,
             "stream": False,
         }
+        if endpoint.use_json_response_format:
+            payload["response_format"] = {"type": "json_object"}
 
         try:
             body = self.urlopen_with_retry(
                 request.Request(
-                    "https://api.deepseek.com/chat/completions",
+                    endpoint.chat_completions_url,
                     data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
                     headers={
-                        "Authorization": f"Bearer {api_key}",
+                        "Authorization": f"Bearer {endpoint.api_key}",
                         "Content-Type": "application/json",
                         "Connection": "close",
                     },
@@ -47,15 +54,16 @@ class MaimaiAiMatcherMixin:
                 ),
                 retries=5,
                 timeout=60,
+                provider_name=endpoint.display_name,
             )
             response = json.loads(body)
-            content = response["choices"][0]["message"]["content"]
+            content = self.extract_chat_content(response)
             parsed = self.parse_ai_json(content)
             batch_result = self.merge_ai_results(results, parsed, requirements, payload, content)
             self.emit_candidate_results(batch_result["results"])
             self.emit(
                 "maimai_ai_done",
-                f"DeepSeek 批量分析完成：处理 {batch_result['processed']} 人，匹配 {batch_result['matched']} 人",
+                f"{endpoint.display_name}批量分析完成：处理 {batch_result['processed']} 人，匹配 {batch_result['matched']} 人",
                 batch_result,
             )
             self.save_batch_summary(batch_result["results"], batch_result)
@@ -66,7 +74,7 @@ class MaimaiAiMatcherMixin:
             self.emit_candidate_results(batch_result["results"])
             self.emit(
                 "maimai_ai_failed",
-                f"DeepSeek 批量分析失败，已回退为空匹配：{exc}",
+                f"{endpoint.display_name}批量分析失败，已回退为空匹配：{exc}",
                 batch_result,
             )
             self.save_batch_summary(batch_result["results"], batch_result)
@@ -355,7 +363,12 @@ class MaimaiAiMatcherMixin:
         return max(0, min(100, int(score)))
 
     @staticmethod
-    def urlopen_with_retry(req: request.Request, retries: int = 5, timeout: int = 60) -> str:
+    def urlopen_with_retry(
+        req: request.Request,
+        retries: int = 5,
+        timeout: int = 60,
+        provider_name: str = "AI 模型",
+    ) -> str:
         last_error = None
         for attempt in range(1, retries + 1):
             try:
@@ -366,23 +379,23 @@ class MaimaiAiMatcherMixin:
             except error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace")
                 if exc.code not in {408, 409, 425, 429, 500, 502, 503, 504}:
-                    raise RuntimeError(f"DeepSeek API 请求失败：HTTP {exc.code} {detail}") from exc
-                last_error = RuntimeError(f"DeepSeek API 请求失败：HTTP {exc.code} {detail}")
+                    raise RuntimeError(f"{provider_name} API 请求失败：HTTP {exc.code} {detail}") from exc
+                last_error = RuntimeError(f"{provider_name} API 请求失败：HTTP {exc.code} {detail}")
             except error.URLError as exc:
-                last_error = RuntimeError(f"DeepSeek API 请求失败：{exc}")
+                last_error = RuntimeError(f"{provider_name} API 请求失败：{exc}")
             except OSError as exc:
-                last_error = RuntimeError(f"DeepSeek API 请求失败：{exc}")
+                last_error = RuntimeError(f"{provider_name} API 请求失败：{exc}")
 
             if attempt < retries:
                 delay = min(2 ** attempt, 20)
-                append_runtime_log(f"DeepSeek retry attempt={attempt} delay={delay}s error={last_error}")
+                append_runtime_log(f"{provider_name} retry attempt={attempt} delay={delay}s error={last_error}")
                 time.sleep(delay)
 
-        raise last_error or RuntimeError("DeepSeek API 请求失败：unknown error")
+        raise last_error or RuntimeError(f"{provider_name} API 请求失败：unknown error")
 
     @staticmethod
     def parse_ai_json(content: str) -> dict:
-        text = str(content or "").strip()
+        text = re.sub(r"<think>.*?</think>", "", str(content or ""), flags=re.I | re.S).strip()
         if text.startswith("```"):
             text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
             text = re.sub(r"\s*```$", "", text)
@@ -396,3 +409,18 @@ class MaimaiAiMatcherMixin:
             if match:
                 return {"results": json.loads(match.group(0))}
             raise RuntimeError(f"AI 没有返回可解析 JSON：{content}")
+
+    @staticmethod
+    def extract_chat_content(response: dict) -> str:
+        try:
+            content = response["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise RuntimeError("AI 模型返回中缺少 choices[0].message.content。") from exc
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "".join(
+                str(part.get("text", "")) if isinstance(part, dict) else str(part)
+                for part in content
+            )
+        return str(content or "")
