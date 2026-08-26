@@ -11,6 +11,9 @@ let optionPickerCategory = "";
 let optionPickerDraft = [];
 let refreshJobsTimer = null;
 let updatePollTimer = null;
+let notificationQueue = [];
+let notificationOpen = false;
+const handledNotificationIds = new Set();
 const fieldIds = [
   "platform",
   "port", "keywords", "job_name", "company_name", "current_city", "expected_city",
@@ -37,6 +40,7 @@ async function api(path, payload) {
 async function loadState(keepForm = false) {
   const res = await fetch("/api/state");
   state = await res.json();
+  processNotifications();
   activeTaskId = state.active_task_id || (state.tasks[0] && state.tasks[0].id) || "";
   renderTasks();
   renderResults();
@@ -377,6 +381,39 @@ async function stopTask() {
     if (!state.running || Date.now() - startedAt > 30000) clearInterval(timer);
   }, 1000);
 }
+function processNotifications() {
+  for (const notification of (state.notifications || [])) {
+    const id = String(notification.id ?? "");
+    if (!id || handledNotificationIds.has(id)) continue;
+    handledNotificationIds.add(id);
+    notificationQueue.push(notification);
+  }
+  while (handledNotificationIds.size > 200) {
+    handledNotificationIds.delete(handledNotificationIds.values().next().value);
+  }
+  showNextNotification();
+}
+function showNextNotification() {
+  if (notificationOpen || !notificationQueue.length) return;
+  const notification = notificationQueue.shift();
+  const overlay = document.getElementById("notificationOverlay");
+  const modal = document.getElementById("notificationModal");
+  if (!overlay || !modal) return;
+  document.getElementById("notificationTitle").textContent = notification.title || "任务状态";
+  document.getElementById("notificationMessage").textContent = notification.message || "操作已结束。";
+  document.getElementById("notificationTime").textContent = notification.time ? `时间：${notification.time}` : "";
+  modal.className = `notification-modal ${["success", "warning", "error"].includes(notification.level) ? notification.level : "info"}`;
+  overlay.classList.add("open");
+  notificationOpen = true;
+}
+function closeNotification(event) {
+  if (event && event.target && event.target.id !== "notificationOverlay") return;
+  const overlay = document.getElementById("notificationOverlay");
+  if (!overlay) return;
+  overlay.classList.remove("open");
+  notificationOpen = false;
+  setTimeout(showNextNotification, 0);
+}
 async function onPlatformChange() {
   applyPlatformUI();
   await openPlatform();
@@ -460,9 +497,9 @@ function renderUpdateProgress(status) {
   else text.textContent = "";
 }
 function renderResults() {
-  const mapComm = {done:"已确认", sent_no_chat_tab:"已发送", already_communicated:"已沟通", failed:"失败", sent:"已发送", test:"测试"};
-  const mapResume = {requested:"已索要", already_requested:"已索要", already_available:"已可看", not_found:"未找到会话", failed:"索要失败"};
-  const mapPhone = {requested:"电话已索要", already_requested:"电话已索要", already_available:"电话可查看", clicked:"电话未确认", not_found:"未找到会话", failed:"电话失败"};
+  const mapComm = {done:"已确认", sent_no_chat_tab:"已发送", already_communicated:"已沟通", failed:"失败", sent:"已发送", test:"测试", skipped:"未启用", skipped_limit:"超过上限", skipped_ai:"AI 跳过", not_matched:"AI 不匹配", unconfirmed:"未确认"};
+  const mapResume = {requested:"已索要", already_requested:"已索要", already_available:"已可看", not_found:"未找到会话", failed:"索要失败", not_started:"未触发"};
+  const mapPhone = {requested:"电话已索要", already_requested:"电话已索要", already_available:"电话可查看", clicked:"电话未确认", not_found:"未找到会话", failed:"电话失败", unavailable:"未找到电话按钮", unconfirmed:"电话申请未确认", not_started:"未触发"};
   document.getElementById("results").innerHTML = (state.results || []).map(item => `
     <tr>
       <td>${escapeHtml(candidateIndex(item))}</td>
@@ -496,8 +533,12 @@ function candidateAction(item, mapComm, mapPhone, mapResume) {
   return item.next_action || "";
 }
 function candidateActionTitle(item) {
-  return [item.communicate_note, item.phone_request_note, item.resume_request_note, listText("优势", item.strengths), listText("风险", item.risks)]
+  return [item.communicate_note, item.phone_request_note, item.resume_request_note, communicationTraceText(item.communication_trace), listText("优势", item.strengths), listText("风险", item.risks)]
     .filter(Boolean).join("；");
+}
+function communicationTraceText(trace) {
+  if (!Array.isArray(trace) || !trace.length) return "";
+  return trace.map(item => [item.stage, item.status, item.message].filter(Boolean).join("：")).join("；");
 }
 function candidateTags(item) {
   const parts = [listText("优势", item.strengths), listText("风险", item.risks)].filter(Boolean);

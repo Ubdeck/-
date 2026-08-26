@@ -20,6 +20,8 @@ KEYWORD_PLACEHOLDER = '搜索提示：输入带双引号的完整词组，如"�
 class MaimaiRecruitPage(MaimaiAiMatcherMixin):
     """Facade for the Maimai recruiting workflow."""
 
+    MAIMAI_CHAT_URL_MARKERS = ("/im", "/chat", "scene=direct_modal", "scene=profile")
+
     def __init__(self, port: int = DEFAULT_BROWSER_PORT, progress_callback=None, stop_event=None) -> None:
         self.progress_callback = progress_callback
         self.stop_event = stop_event
@@ -361,6 +363,46 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
             time.sleep(0.25)
         raise RuntimeError(f"脉脉第一个候选人打开失败：{last_result}")
 
+    def run_communication_smoke_test(self, candidate_limit: int = 5, greeting: str = "") -> list[dict]:
+        """Run a bounded live communication check against candidates already shown in the drawer."""
+        candidate_limit = max(1, min(int(candidate_limit or 5), 5))
+        greeting = self.clean_config_value(greeting) or DEFAULT_MAIMAI_GREETING
+        candidates = self.drawer_candidate_descriptors()
+        if not candidates:
+            self.open_first_candidate()
+            candidates = self.drawer_candidate_descriptors()
+        if not candidates:
+            raise RuntimeError("候选人列表未加载，无法执行沟通测试。")
+
+        results: list[dict] = []
+        for position, candidate in enumerate(candidates[:candidate_limit], start=1):
+            name = str(candidate.get("name") or "")
+            item = {
+                "test_index": position,
+                "name": name,
+                "communication_trace": [],
+                "communicate_status": "not_started",
+                "communicate_note": "",
+                "phone_request_status": "not_started",
+                "phone_request_note": "",
+            }
+            try:
+                opened = self.open_drawer_candidate(candidate)
+                self.record_maimai_action(item, "定位候选人", "confirmed", f"已定位到候选人：{opened.get('name') or name}")
+                result = self.communicate_current_candidate_and_request_phone(name, greeting=greeting)
+                item["communicate_status"] = result.get("status", "unknown")
+                item["communicate_note"] = result.get("message", "")
+                item["communication_trace"].extend(result.get("trace", []))
+                phone = result.get("phone") or {}
+                item["phone_request_status"] = phone.get("status", "not_started")
+                item["phone_request_note"] = phone.get("message", "")
+            except Exception as exc:
+                item["communicate_status"] = "failed"
+                item["communicate_note"] = str(exc)
+                self.record_maimai_action(item, "沟通流程", "failed", str(exc))
+            results.append(item)
+        return results
+
     def wait_for_candidate_detail(self, timeout: float = 8.0) -> None:
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -471,7 +513,24 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
         candidates: list[dict],
         config: dict,
     ) -> None:
+        for item in page_results:
+            item.setdefault("communication_trace", [])
+            item.setdefault("phone_request_status", "not_started")
+            item.setdefault("phone_request_note", "尚未进入交换手机步骤。")
+            if not item.get("match"):
+                item.setdefault("communicate_status", "not_matched")
+                item.setdefault("communicate_note", "AI 判断不匹配，未触发沟通或交换手机。")
+                self.record_maimai_action(item, "沟通", "not_matched", item["communicate_note"])
+            elif item.get("next_action") == "skip":
+                item.setdefault("communicate_status", "skipped_ai")
+                item.setdefault("communicate_note", "AI 建议跳过，未触发沟通或交换手机。")
+                self.record_maimai_action(item, "沟通", "skipped", item["communicate_note"])
         if not bool(config.get("maimai_auto_communicate", False)):
+            for item in page_results:
+                if item.get("match") and item.get("next_action") != "skip":
+                    item["communicate_status"] = "skipped"
+                    item["communicate_note"] = "未启用脉脉自动沟通，本次没有发送沟通或申请交换手机。"
+                    self.record_maimai_action(item, "沟通", "skipped", item["communicate_note"])
             return
         limit = self.clean_optional_positive_int(config.get("maimai_communicate_limit"))
         greeting = self.clean_config_value(config.get("maimai_greeting")) or DEFAULT_MAIMAI_GREETING
@@ -480,23 +539,27 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
             if not item.get("match") or item.get("next_action") == "skip":
                 continue
             if limit is not None and attempted >= limit:
-                item["communicate_status"] = "pending"
+                item["communicate_status"] = "skipped_limit"
                 item["communicate_note"] = "已达到本次脉脉沟通测试上限，留待后续处理。"
+                self.record_maimai_action(item, "沟通", "skipped", item["communicate_note"])
                 continue
             page_index = self.clean_optional_positive_int(item.get("page_candidate_index"))
             if not page_index or page_index > len(candidates):
                 item["communicate_status"] = "failed"
                 item["communicate_note"] = "找不到对应的页内候选人卡片。"
+                self.record_maimai_action(item, "定位候选人", "failed", item["communicate_note"])
                 continue
             attempted += 1
             index = item.get("global_candidate_index") or item.get("page_candidate_index") or ""
             name = str(item.get("name") or "")
             self.emit("maimai_communicate_start", f"第 {index} 个脉脉候选人匹配，准备沟通：{name}")
             try:
-                self.open_drawer_candidate(candidates[page_index - 1])
+                opened = self.open_drawer_candidate(candidates[page_index - 1])
+                self.record_maimai_action(item, "定位候选人", "confirmed", f"已定位到候选人：{opened.get('name') or name}")
                 communicate_result = self.communicate_current_candidate_and_request_phone(name, greeting=greeting)
                 item["communicate_status"] = communicate_result.get("status", "unknown")
                 item["communicate_note"] = communicate_result.get("message", "")
+                item["communication_trace"].extend(communicate_result.get("trace", []))
                 phone = communicate_result.get("phone") or {}
                 if phone:
                     item["phone_request_status"] = phone.get("status", "unknown")
@@ -509,54 +572,124 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
             except Exception as exc:
                 item["communicate_status"] = "failed"
                 item["communicate_note"] = str(exc)
+                item["phone_request_status"] = "not_started"
+                item["phone_request_note"] = "沟通流程未完成，未触发交换手机。"
+                self.record_maimai_action(item, "沟通流程", "failed", str(exc))
                 self.emit(
                     "maimai_communicate_failed",
                     f"第 {index} 个脉脉候选人沟通失败：{exc}",
                     {"error": str(exc), "candidate": item},
                 )
 
+    @staticmethod
+    def record_maimai_action(item: dict, stage: str, status: str, message: str, data: dict | None = None) -> None:
+        trace = item.setdefault("communication_trace", [])
+        trace.append(
+            {
+                "time": time.strftime("%H:%M:%S"),
+                "stage": stage,
+                "status": status,
+                "message": str(message or ""),
+                "data": data or {},
+            }
+        )
+
     def communicate_current_candidate_and_request_phone(self, expected_name: str = "", greeting: str = "") -> dict:
         before_tab_id = self.page.tab_id
         before_tabs = set(self.page.tab_ids)
-        if expected_name:
-            self.wait_for_candidate_detail_name(expected_name, timeout=3.0)
-        button = self.click_current_candidate_immediate_communicate(expected_name=expected_name)
-        opened_existing_chat = button.get("status") == "already_communicated"
-        if opened_existing_chat:
-            self.emit("maimai_communicate_send", f"{button.get('message', '候选人已沟通过')} 正在进入消息页处理交换手机")
-            retry_before_tabs = set(self.page.tab_ids)
-            self.click_current_candidate_existing_communicate(expected_name=expected_name)
-            chat_tab = self.wait_for_new_maimai_chat_tab(retry_before_tabs, fallback_tab_id=before_tab_id)
-        else:
-            self.emit("maimai_communicate_send", f"正在填写招呼语并点击发送后继续沟通：{expected_name}" if greeting else f"正在点击发送后继续沟通：{expected_name}")
-            self.click_send_then_continue(greeting=greeting)
-            self.emit("maimai_communicate_send", "脉脉发送弹窗已关闭，正在等待消息页")
-            try:
-                chat_tab = self.wait_for_new_maimai_chat_tab(before_tabs, fallback_tab_id=before_tab_id)
-            except RuntimeError as exc:
-                send_state = self.inspect_maimai_communicate_send_state()
-                if send_state.get("sent"):
-                    self.emit("maimai_communicate_send", "沟通已发送但消息页未自动打开，正在从当前候选人的沟通按钮进入消息页")
+        trace: list[dict] = []
+        chat_tab = None
+
+        def step(stage: str, status: str, message: str, data: dict | None = None) -> None:
+            entry = {
+                "time": time.strftime("%H:%M:%S"),
+                "stage": stage,
+                "status": status,
+                "message": str(message or ""),
+                "data": data or {},
+            }
+            trace.append(entry)
+            self.emit("maimai_communication_step", f"{stage}：{message}", entry)
+
+        def result(status: str, message: str, phone: dict | None = None) -> dict:
+            return {"status": status, "message": message, "phone": phone or {}, "trace": trace}
+
+        try:
+            if expected_name:
+                self.wait_for_candidate_detail_name(expected_name, timeout=5.0)
+            step("候选人核对", "confirmed", f"当前详情页已确认：{expected_name or '当前候选人'}")
+
+            button = self.click_current_candidate_immediate_communicate(expected_name=expected_name)
+            if button.get("status") == "quick_reply_skip":
+                step("沟通状态", "skipped_quick_reply", button.get("message", "候选人为快捷回复状态，未触发沟通。"), button)
+                return result(
+                    "skipped_quick_reply",
+                    button.get("message", "候选人为快捷回复状态，未触发沟通。"),
+                    {"status": "skipped", "message": "候选人为快捷回复状态，未触发交换手机。"},
+                )
+            opened_existing_chat = button.get("status") == "already_communicated"
+            if opened_existing_chat:
+                step("沟通状态", "already_communicated", button.get("message", "候选人此前已沟通过。"), button)
+                retry_before_tabs = set(self.page.tab_ids)
+                self.click_current_candidate_existing_communicate(expected_name=expected_name)
+                step("打开消息页", "clicked", "已点击候选人的沟通按钮，等待消息页。")
+                chat_tab = self.wait_for_new_maimai_chat_tab(
+                    retry_before_tabs,
+                    fallback_tab_id=before_tab_id,
+                    expected_name=expected_name,
+                )
+                communicate_status = "already_communicated"
+            else:
+                step("立即沟通", "clicked", "已点击立即沟通，等待发送弹窗。", button)
+                modal_state = self.wait_for_maimai_send_modal(timeout=8.0)
+                if not modal_state.get("open"):
+                    step("发送沟通", "unconfirmed", modal_state.get("message", "未检测到发送弹窗，未再次点击以避免重复沟通。"), modal_state)
+                    return result("unconfirmed", f"未确认是否已发送沟通：{modal_state.get('message', '')}", {"status": "not_started", "message": "沟通发送未确认，未触发交换手机。"})
+                self.emit("maimai_communicate_send", f"正在填写招呼语并点击发送后继续沟通：{expected_name}" if greeting else f"正在点击发送后继续沟通：{expected_name}")
+                send_result = self.click_send_then_continue(greeting=greeting)
+                if not send_result.get("confirmed"):
+                    step("发送沟通", "unconfirmed", send_result.get("message", "发送后的页面状态未确认，未重复发送。"), send_result)
+                    return result("unconfirmed", f"沟通发送状态未确认：{send_result.get('message', '')}", {"status": "not_started", "message": "沟通发送未确认，未触发交换手机。"})
+                send_state = self.wait_for_maimai_send_confirmation(timeout=12.0)
+                if not send_state.get("sent"):
+                    step("发送沟通", "unconfirmed", send_state.get("message", "发送弹窗已关闭，但未确认沟通状态。"), send_state)
+                    return result("unconfirmed", f"沟通发送状态未确认：{send_state.get('message', '')}", {"status": "not_started", "message": "沟通发送未确认，未触发交换手机。"})
+                step("发送沟通", "confirmed", "已确认沟通发送成功，候选人按钮已变为沟通状态。", send_state)
+                communicate_status = "sent"
+                try:
+                    chat_tab = self.wait_for_new_maimai_chat_tab(
+                        before_tabs,
+                        fallback_tab_id=before_tab_id,
+                        expected_name=expected_name,
+                    )
+                except RuntimeError:
+                    step("打开消息页", "retry", "沟通已发送但消息页未自动打开，改从当前候选人的沟通按钮进入。")
                     retry_before_tabs = set(self.page.tab_ids)
                     self.click_current_candidate_existing_communicate(expected_name=expected_name)
-                    chat_tab = self.wait_for_new_maimai_chat_tab(retry_before_tabs, fallback_tab_id=before_tab_id)
-                else:
-                    raise RuntimeError(f"{exc}；发送状态未确认：{send_state.get('message', '')}") from exc
-        phone_result = {"status": "unknown", "message": ""}
-        try:
+                    chat_tab = self.wait_for_new_maimai_chat_tab(
+                        retry_before_tabs,
+                        fallback_tab_id=before_tab_id,
+                        expected_name=expected_name,
+                    )
+
             self.emit("maimai_phone_request", "脉脉消息页已打开，正在等待会话加载")
-            self.wait_for_maimai_chat_page(chat_tab, expected_name=expected_name)
-            self.emit("maimai_phone_request", "正在点击交换手机")
-            phone_result = self.request_phone_in_maimai_chat(chat_tab)
+            self.wait_for_maimai_chat_page(chat_tab, expected_name=expected_name, timeout=30.0)
+            step("消息页", "confirmed", "已确认进入目标候选人的消息会话。")
+            self.emit("maimai_phone_request", "正在申请交换手机")
+            phone_result = self.request_phone_in_maimai_chat(chat_tab, timeout=20.0)
+            step("交换手机", phone_result.get("status", "unknown"), phone_result.get("message", ""), phone_result)
             self.emit("maimai_phone_request", f"交换手机结果：{phone_result.get('status')}，{phone_result.get('message', '')}")
-            prefix = "已进入已沟通过候选人的消息页处理交换手机" if opened_existing_chat else "已发送沟通并进入消息页处理交换手机"
-            return {
-                "status": "done",
-                "message": f"{prefix}：{phone_result.get('message', '')}",
-                "phone": phone_result,
-            }
+            return result(communicate_status, f"沟通已确认；{phone_result.get('message', '')}", phone_result)
+        except Exception as exc:
+            stage = "消息页/交换手机" if chat_tab is not None else "沟通发送"
+            message = f"{stage}未完成：{exc}"
+            step(stage, "failed", message)
+            if chat_tab is not None:
+                return result("sent" if trace and any(entry["stage"] == "发送沟通" and entry["status"] == "confirmed" for entry in trace) else "failed", message, {"status": "not_started", "message": "沟通后续流程失败，未确认交换手机。"})
+            return result("failed", message, {"status": "not_started", "message": "沟通未完成，未触发交换手机。"})
         finally:
-            self.close_maimai_chat_tab_and_return(chat_tab, before_tab_id)
+            if chat_tab is not None:
+                self.close_maimai_chat_tab_and_return(chat_tab, before_tab_id)
 
     def click_current_candidate_immediate_communicate(self, expected_name: str = "", timeout: float = 8.0) -> dict:
         return self.click_current_candidate_communicate_button(
@@ -590,34 +723,37 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
                 };
                 const clean = value => String(value || '').replace(/\\s+/g, ' ').trim();
                 const textOf = ele => clean(ele.innerText || ele.textContent);
-                const actionTexts = mode === 'existing' ? ['沟通', '继续沟通'] : ['立即沟通', '沟通', '继续沟通'];
+                const actionTexts = mode === 'existing' ? ['沟通', '继续沟通', '发消息'] : ['立即沟通', '沟通', '继续沟通', '发消息'];
                 const exactActionText = text => actionTexts.includes(clean(text));
-                const roots = Array.from(document.querySelectorAll('.ant-drawer-open .ant-drawer-content, .ant-drawer-content, [class*=drawer], [class*=Drawer]'))
+                const drawer = document.querySelector('.ant-drawer-open .ant-drawer-content')
+                  || document.querySelector('.ant-drawer-content');
+                const rightPanel = drawer && Array.from(drawer.querySelectorAll('[class*=right___]'))
                   .filter(visible)
-                  .filter(ele => {
-                    const text = textOf(ele);
-                    return (!expectedName || text.includes(expectedName))
-                      && actionTexts.some(action => text.includes(action));
-                  });
-                if (expectedName) {
-                  Array.from(document.querySelectorAll('*'))
-                    .filter(visible)
-                    .map(ele => ({ele, text: textOf(ele), rect: ele.getBoundingClientRect()}))
-                    .filter(item => item.text.includes(expectedName) && actionTexts.some(action => item.text.includes(action)))
-                    .sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height))
-                    .slice(0, 6)
-                    .forEach(item => roots.push(item.ele));
+                  .sort((a, b) => b.getBoundingClientRect().width - a.getBoundingClientRect().width)[0];
+                if (!drawer) {
+                  return {ok: false, reason: 'candidate drawer not found', expected_name: expectedName};
                 }
-                const contextHasName = ele => {
-                  if (!expectedName) return false;
-                  let node = ele;
-                  for (let depth = 0; node && depth < 8; depth += 1, node = node.parentElement) {
-                    if (textOf(node).includes(expectedName)) return true;
-                  }
-                  return false;
-                };
-                const inKnownRoot = ele => roots.some(root => root.contains(ele));
-                const buttons = Array.from(document.querySelectorAll('.mui-btn, button, [role=button], a, div, span'))
+                if (!rightPanel) {
+                  return {ok: false, reason: 'candidate right action panel not found', expected_name: expectedName};
+                }
+                const panelButtons = Array.from(rightPanel.querySelectorAll('.mui-btn, button, [role=button], a, div'))
+                  .filter(visible)
+                  .map(textOf)
+                  .filter(Boolean)
+                  .slice(0, 30);
+                if (mode === 'immediate' && panelButtons.includes('快捷回复')) {
+                  return {
+                    ok: true,
+                    status: 'quick_reply_skip',
+                    text: '快捷回复',
+                    message: '右侧按钮为“快捷回复”，说明候选人已投递职位，本次不触发立即沟通或交换手机。',
+                    expected_name: expectedName,
+                    panel_buttons: panelButtons,
+                  };
+                }
+                // Only click buttons in the selected candidate's right action panel.
+                // The left list and drawer containers may also contain the same text.
+                const buttons = Array.from(rightPanel.querySelectorAll('.mui-btn, button, [role=button], a, div'))
                   .filter(visible)
                   .map(ele => {
                     const clickable = ele.closest('.mui-btn, button, [role=button], a') || ele;
@@ -640,8 +776,7 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
                         if (item.text === '沟通') score += 1000;
                         if (item.text === '继续沟通') score += 950;
                       }
-                      if (inKnownRoot(item.target)) score += 300;
-                      if (contextHasName(item.target)) score += 180;
+                      if (item.text === '发消息') score += 650;
                       if (item.cls.includes('mui-btn-primary')) score += 50;
                       if (item.cls.includes('mui-btn')) score += 35;
                       if (item.tag === 'button' || item.tag === 'a') score += 20;
@@ -652,7 +787,12 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
                   });
                 const target = buttons[0];
                 if (!target) {
-                  return {ok: false, reason: mode === 'existing' ? 'existing communicate button not found' : 'communicate button not found', expected_name: expectedName, roots: roots.length};
+                  return {
+                    ok: false,
+                    reason: mode === 'existing' ? 'existing communicate button not found in right panel' : 'communicate button not found in right panel',
+                    expected_name: expectedName,
+                    panel_buttons: panelButtons,
+                  };
                 }
                 if (mode === 'immediate' && target.text !== '立即沟通') {
                   const already = target;
@@ -665,7 +805,7 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
                 for (const name of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
                   button.dispatchEvent(new MouseEvent(name, {bubbles: true, cancelable: true, composed: true, view: window}));
                 }
-                return {ok: true, status: 'clicked', text: target.text, class_name: target.cls, expected_name: expectedName, roots: roots.length};
+                return {ok: true, status: 'clicked', text: target.text, class_name: target.cls, expected_name: expectedName};
                 """,
                 expected_name,
                 mode,
@@ -695,7 +835,7 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
                 };
                 const clean = value => String(value || '').replace(/\\s+/g, ' ').trim();
                 const textOf = ele => clean(ele.innerText || ele.textContent);
-                const scopes = Array.from(document.querySelectorAll('.mui-modal-wrap .mui-modal, [role=dialog], [class*=modal], [class*=Modal], [class*=dialog], [class*=Dialog]'))
+                const scopes = Array.from(document.querySelectorAll('.mui-modal-wrap'))
                   .filter(visible)
                   .filter(ele => {
                     const text = textOf(ele);
@@ -731,38 +871,112 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
                   if (currentValue !== greeting) return {ok: false, reason: 'greeting input value not confirmed', value: currentValue};
                   greetingFilled = true;
                 }
-                const target = Array.from(scope.querySelectorAll('.mui-btn, button, [role=button], a, div, span'))
+                const target = Array.from(scope.querySelectorAll('button'))
                   .filter(visible)
                   .map(ele => {
-                    const clickable = ele.closest('.mui-btn, button, [role=button], a') || ele;
                     return {
-                      ele: clickable,
+                      ele,
                       text: textOf(ele),
-                      cls: String(clickable.className || ''),
-                      rect: clickable.getBoundingClientRect(),
+                      cls: String(ele.className || ''),
+                      rect: ele.getBoundingClientRect(),
                     };
                   })
                   .filter(item => item.text === '发送后继续沟通')
                   .sort((a, b) => {
-                    const aButton = a.cls.includes('mui-btn') ? 0 : 1;
-                    const bButton = b.cls.includes('mui-btn') ? 0 : 1;
-                    return aButton - bButton || a.rect.top - b.rect.top;
+                    return a.rect.top - b.rect.top;
                   })[0];
                 if (!target) return {ok: false, reason: 'send then continue button not found'};
-                for (const name of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
-                  target.ele.dispatchEvent(new MouseEvent(name, {bubbles: true, cancelable: true, composed: true, view: window}));
-                }
-                return {ok: true, text: target.text, class_name: target.cls, greeting_filled: greetingFilled};
+                target.ele.scrollIntoView({block: 'center', inline: 'nearest'});
+                target.ele.click();
+                return {
+                  ok: true,
+                  clicked: true,
+                  text: target.text,
+                  class_name: target.cls,
+                  greeting_filled: greetingFilled,
+                };
                 """,
                 greeting,
             )
             if last_result and last_result.get("ok"):
-                if self.wait_for_maimai_send_modal_closed(timeout=3.0):
-                    return {**last_result, "confirmed": True}
-                last_result = {**last_result, "reason": "send modal did not close after click"}
+                if self.wait_for_maimai_send_modal_closed(timeout=8.0):
+                    return {**last_result, "confirmed": True, "message": "发送按钮已点击且沟通弹窗已关闭。"}
+                return {
+                    **last_result,
+                    "confirmed": False,
+                    "reason": "发送按钮已点击，但 8 秒内沟通弹窗未关闭；为避免重复发送，未再次点击。",
+                    "message": "发送按钮已点击，但 8 秒内沟通弹窗未关闭；为避免重复发送，未再次点击。",
+                }
             self.check_stopped()
             time.sleep(0.3)
-        raise RuntimeError(f"脉脉发送后继续沟通按钮点击失败：{last_result}")
+        return {
+            "ok": False,
+            "confirmed": False,
+            "message": f"发送弹窗内未找到可用的“发送后继续沟通”按钮：{last_result}",
+        }
+
+    def wait_for_maimai_send_modal(self, timeout: float = 8.0) -> dict:
+        deadline = time.time() + timeout
+        state = None
+        while time.time() < deadline:
+            state = self.page.run_js(
+                """
+                const visible = ele => {
+                  const rect = ele.getBoundingClientRect();
+                  const style = getComputedStyle(ele);
+                  return rect.width > 0 && rect.height > 0
+                    && style.display !== 'none'
+                    && style.visibility !== 'hidden';
+                };
+                const clean = value => String(value || '').replace(/\\s+/g, ' ').trim();
+                const scopes = Array.from(document.querySelectorAll('.mui-modal-wrap'))
+                  .filter(visible)
+                  .filter(ele => {
+                    const text = clean(ele.innerText || ele.textContent);
+                    return text.includes('招聘立即沟通')
+                      && text.includes('发送后继续沟通')
+                      && !!ele.querySelector('textarea.templateInput___19bTd, textarea');
+                  })
+                  .sort((a, b) => b.getBoundingClientRect().width * b.getBoundingClientRect().height
+                    - a.getBoundingClientRect().width * a.getBoundingClientRect().height);
+                const scope = scopes[0];
+                if (!scope) return {open: false, message: '未检测到招聘立即沟通弹窗。'};
+                const input = scope.querySelector('textarea.templateInput___19bTd, textarea');
+                const button = Array.from(scope.querySelectorAll('button'))
+                  .find(ele => clean(ele.innerText || ele.textContent) === '发送后继续沟通');
+                return {
+                  open: true,
+                  message: '已检测到招聘立即沟通弹窗。',
+                  candidate: clean(scope.querySelector('[class*=intro-name]')?.innerText || ''),
+                  input_value: clean(input?.value || input?.innerText || ''),
+                  send_button: !!button,
+                  sample: clean(scope.innerText || scope.textContent).slice(0, 500),
+                };
+                """
+            )
+            if state and state.get("open"):
+                return state
+            self.check_stopped()
+            time.sleep(0.25)
+        return state or {"open": False, "message": "等待招聘立即沟通弹窗超时。"}
+
+    def wait_for_maimai_send_confirmation(self, timeout: float = 12.0) -> dict:
+        deadline = time.time() + timeout
+        state = None
+        while time.time() < deadline:
+            state = self.inspect_maimai_communicate_send_state()
+            if state and state.get("sent"):
+                return state
+            self.check_stopped()
+            time.sleep(0.35)
+        return {
+            **(state or {}),
+            "sent": False,
+            "message": (
+                f"发送动作后 {timeout:.0f} 秒内未确认候选人按钮变为“沟通”；"
+                f"当前页面证据：{(state or {}).get('message', '无')}"
+            ),
+        }
 
     def wait_for_maimai_send_modal_closed(self, timeout: float = 3.0) -> bool:
         deadline = time.time() + timeout
@@ -791,7 +1005,13 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
             time.sleep(0.2)
         return False
 
-    def wait_for_new_maimai_chat_tab(self, before_tabs: set[str], fallback_tab_id: str, timeout: float = 25.0):
+    def wait_for_new_maimai_chat_tab(
+        self,
+        before_tabs: set[str],
+        fallback_tab_id: str,
+        expected_name: str = "",
+        timeout: float = 25.0,
+    ):
         deadline = time.time() + timeout
         last_tabs: list[str] = []
         while time.time() < deadline:
@@ -802,13 +1022,13 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
                 tab = self.page.get_tab(tab_id)
                 try:
                     url = str(tab.url or "")
-                    if "maimai.cn" in url and ("/im" in url or "scene=direct_modal" in url or "scene=profile" in url):
+                    if self.is_maimai_chat_url(url):
                         return tab
                 except Exception:
                     return tab
             try:
                 current_url = str(self.page.url or "")
-                if "/im" in current_url or "scene=direct_modal" in current_url:
+                if self.page.tab_id not in before_tabs and self.is_maimai_chat_url(current_url):
                     return self.page
             except Exception:
                 pass
@@ -821,15 +1041,22 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
                         tab_id
                         and tab_id not in before_tabs
                         and target.get("type") == "page"
-                        and "maimai.cn" in url
-                        and ("/im" in url or "scene=direct_modal" in url)
+                        and self.is_maimai_chat_url(url)
                     ):
                         return self.page.get_tab(tab_id)
             except Exception:
                 pass
             self.check_stopped()
             time.sleep(0.35)
-        raise RuntimeError(f"脉脉消息页新标签未打开：before={sorted(before_tabs)} after={last_tabs} current={fallback_tab_id}")
+        raise RuntimeError(
+            "脉脉消息页未打开或未切换到新会话："
+            f"候选人={expected_name or '未知'} before={sorted(before_tabs)} after={last_tabs} current={fallback_tab_id}"
+        )
+
+    @classmethod
+    def is_maimai_chat_url(cls, url: str) -> bool:
+        text = str(url or "")
+        return "maimai.cn" in text and any(marker in text for marker in cls.MAIMAI_CHAT_URL_MARKERS)
 
     def inspect_maimai_communicate_send_state(self, timeout: float = 5.0) -> dict:
         deadline = time.time() + timeout
@@ -854,13 +1081,16 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
                   });
                 const drawer = document.querySelector('.ant-drawer-open .ant-drawer-content')
                   || document.querySelector('.ant-drawer-content');
-                const actionTexts = drawer
-                  ? Array.from(drawer.querySelectorAll('.mui-btn, button, [role=button], a'))
+                const rightPanel = drawer && Array.from(drawer.querySelectorAll('[class*=right___]'))
+                  .filter(visible)
+                  .sort((a, b) => b.getBoundingClientRect().width - a.getBoundingClientRect().width)[0];
+                const actionTexts = rightPanel
+                  ? Array.from(rightPanel.querySelectorAll('.mui-btn, button, [role=button], a, div'))
                     .filter(visible)
                     .map(textOf)
-                    .filter(text => ['立即沟通', '沟通', '继续沟通'].includes(text))
+                    .filter(text => ['立即沟通', '沟通', '继续沟通', '发消息'].includes(text))
                   : [];
-                const sent = !hasSendModal && (actionTexts.includes('沟通') || actionTexts.includes('继续沟通'));
+                const sent = !hasSendModal && (actionTexts.includes('沟通') || actionTexts.includes('继续沟通') || actionTexts.includes('发消息'));
                 return {
                   sent,
                   has_send_modal: hasSendModal,
@@ -928,7 +1158,7 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
             time.sleep(0.4)
         raise RuntimeError(f"脉脉消息页未加载完成：{state}")
 
-    def request_phone_in_maimai_chat(self, chat_tab, timeout: float = 12.0) -> dict:
+    def request_phone_in_maimai_chat(self, chat_tab, timeout: float = 20.0) -> dict:
         deadline = time.time() + timeout
         last_result = None
         while time.time() < deadline:
@@ -938,9 +1168,6 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
                 time.sleep(0.3)
                 continue
             active_text = self.read_maimai_active_chat_text(frame)
-            existing_state = self.read_maimai_phone_request_state(active_text, already=True)
-            if existing_state:
-                return existing_state
             click_result = frame.run_js(
                 """
                 const visible = ele => {
@@ -953,13 +1180,14 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
                 };
                 const clean = value => String(value || '').replace(/\\s+/g, ' ').trim();
                 const textOf = ele => clean(ele.innerText || ele.textContent);
-                const candidates = Array.from(document.querySelectorAll('.tool.normal, [class*=tool], button, [role=button], a'))
+                const candidates = Array.from(document.querySelectorAll('.tool, .tool.normal, button, [role=button], a, div, span'))
                   .filter(visible)
                   .map(ele => {
+                    const clickable = ele.closest('.tool, .tool.normal, button, [role=button], a') || ele;
                     const rect = ele.getBoundingClientRect();
-                    return {ele, text: textOf(ele), cls: String(ele.className || ''), rect};
+                    return {ele: clickable, text: textOf(ele), cls: String(clickable.className || ''), rect};
                   })
-                  .filter(item => item.text === '交换手机')
+                  .filter(item => ['交换手机', '申请中', '拨打电话'].includes(item.text))
                   .sort((a, b) => {
                     const aTool = a.cls.includes('tool normal') ? 0 : 1;
                     const bTool = b.cls.includes('tool normal') ? 0 : 1;
@@ -968,28 +1196,87 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
                   });
                 const target = candidates[0];
                 if (!target) return {ok: false, reason: 'exchange phone tool not found'};
-                target.ele.scrollIntoView({block: 'center', inline: 'nearest'});
-                for (const name of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
-                  target.ele.dispatchEvent(new MouseEvent(name, {bubbles: true, cancelable: true, composed: true, view: window}));
+                if (target.text === '申请中') {
+                  return {ok: true, state: 'already_requested', text: target.text, message: '按钮显示“申请中”，之前已申请交换手机，未重复点击。'};
                 }
-                return {ok: true, text: target.text, class_name: target.cls};
+                if (target.text === '拨打电话') {
+                  return {ok: true, state: 'already_available', text: target.text, message: '按钮显示“拨打电话”，说明已有手机号，无需交换。'};
+                }
+                target.ele.scrollIntoView({block: 'center', inline: 'nearest'});
+                target.ele.click();
+                return {ok: true, clicked: true, text: target.text, class_name: target.cls};
                 """
             )
             if click_result and click_result.get("ok"):
-                confirm_result = self.confirm_maimai_phone_request(frame)
-                requested_state = self.wait_for_maimai_phone_request_state(frame, timeout=4.0)
+                if click_result.get("state") in {"already_requested", "already_available"}:
+                    return {
+                        "status": click_result["state"],
+                        "message": click_result.get("message", ""),
+                        "data": {"button": click_result},
+                    }
+                requested_state = self.wait_for_maimai_phone_button_state(frame, timeout=12.0)
                 if requested_state:
-                    requested_state["status"] = "requested" if requested_state.get("status") == "already_requested" else requested_state.get("status")
+                    requested_state["status"] = "requested"
+                    requested_state["message"] = "已点击交换手机，按钮已变为“申请中”。"
+                    requested_state["data"] = {"click": click_result, "button": requested_state.get("data", {})}
                     return requested_state
                 active_text = self.read_maimai_active_chat_text(frame)
                 return {
-                    "status": "clicked",
-                    "message": f"已点击交换手机，但未确认到申请状态。确认弹窗：{confirm_result.get('message', '') if isinstance(confirm_result, dict) else ''}；当前会话片段：{active_text[:120]}",
+                    "status": "unconfirmed",
+                    "message": (
+                        "已点击交换手机，但 12 秒内未看到按钮变为“申请中”；"
+                        f"当前会话片段：{active_text[:240]}"
+                    ),
+                    "data": {"click": click_result},
                 }
             last_result = {"reason": "exchange phone button not found", "sample": active_text[:240]}
             self.check_stopped()
             time.sleep(0.5)
-        return {"status": "failed", "message": str(last_result or "交换手机按钮未找到")}
+        return {
+            "status": "unavailable",
+            "message": "当前会话未找到可用的交换手机按钮，未触发申请。",
+            "data": {"last_result": last_result or {}},
+        }
+
+    def read_maimai_phone_button_state(self, chat_frame) -> dict:
+        button = chat_frame.run_js(
+            """
+            const visible = ele => {
+              const rect = ele.getBoundingClientRect();
+              const style = getComputedStyle(ele);
+              return rect.width > 0 && rect.height > 0
+                && style.display !== 'none'
+                && style.visibility !== 'hidden'
+                && !ele.disabled;
+            };
+            const clean = value => String(value || '').replace(/\\s+/g, ' ').trim();
+            const textOf = ele => clean(ele.innerText || ele.textContent);
+            const target = Array.from(document.querySelectorAll('.tool, .tool.normal, button, [role=button], a, div, span'))
+              .filter(visible)
+              .map(ele => {
+                const clickable = ele.closest('.tool, .tool.normal, button, [role=button], a') || ele;
+                return {text: textOf(ele), cls: String(clickable.className || '')};
+              })
+              .find(item => ['交换手机', '申请中', '拨打电话'].includes(item.text));
+            if (!target) return {found: false, message: '未找到交换手机/申请中/拨打电话按钮。'};
+            return {found: true, text: target.text, class_name: target.cls};
+            """
+        )
+        return button if isinstance(button, dict) else {"found": False, "message": "按钮状态未知。"}
+
+    def wait_for_maimai_phone_button_state(self, chat_frame, timeout: float = 4.0) -> dict | None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            last_button = self.read_maimai_phone_button_state(chat_frame)
+            if last_button and last_button.get("text") == "申请中":
+                return {
+                    "status": "already_requested",
+                    "message": "按钮显示“申请中”，手机号交换申请已在处理中。",
+                    "data": last_button,
+                }
+            self.check_stopped()
+            time.sleep(0.35)
+        return None
 
     def read_maimai_active_chat_text(self, chat_frame) -> str:
         return str(
@@ -1003,11 +1290,10 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
                     && style.visibility !== 'hidden';
                 };
                 const clean = value => String(value || '').replace(/\\s+/g, ' ').trim();
-                return Array.from(document.querySelectorAll('*'))
-                  .filter(visible)
-                  .map(ele => clean(ele.innerText || ele.textContent))
-                  .filter(Boolean)
-                  .join(' ');
+                const dialogue = document.querySelector('.dialogue-container');
+                return dialogue
+                  ? clean(dialogue.innerText || dialogue.textContent)
+                  : '';
                 """
             )
             or ""
@@ -1049,9 +1335,12 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
             time.sleep(0.2)
         return None
 
-    def confirm_maimai_phone_request(self, chat_frame) -> dict:
-        try:
-            result = chat_frame.run_js(
+    def confirm_maimai_phone_request(self, chat_frame, timeout: float = 8.0) -> dict:
+        deadline = time.time() + timeout
+        last_result: dict = {"appeared": False, "confirmed": False, "message": "等待交换手机确认弹窗。"}
+        while time.time() < deadline:
+            try:
+                result = chat_frame.run_js(
                 """
                 const visible = ele => {
                   const rect = ele.getBoundingClientRect();
@@ -1069,6 +1358,9 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
                     const text = textOf(ele);
                     return (text.includes('交换手机') || text.includes('手机号') || text.includes('手机')) && /确定|确认|申请/.test(text);
                   });
+                if (!scopes.length) {
+                  return {appeared: false, confirmed: false, message: '尚未出现交换手机确认弹窗'};
+                }
                 for (const scope of scopes) {
                   const button = Array.from(scope.querySelectorAll('button, [role=button], a, div, span'))
                     .filter(visible)
@@ -1078,15 +1370,37 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
                     for (const name of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
                       button.ele.dispatchEvent(new MouseEvent(name, {bubbles: true, cancelable: true, composed: true, view: window}));
                     }
-                    return {ok: true, text: button.text, message: `已点击确认按钮：${button.text}`};
+                    return {appeared: true, confirmed: true, text: button.text, message: `已点击交换手机确认按钮：${button.text}`};
                   }
                 }
-                return {ok: false, reason: 'no confirm dialog', message: '未出现确认弹窗'};
+                return {
+                  appeared: true,
+                  confirmed: false,
+                  reason: 'confirm button not found',
+                  message: '已出现交换手机确认弹窗，但未找到可用确认按钮',
+                  sample: textOf(scopes[0]).slice(0, 400),
+                };
                 """
-            )
-            return result if isinstance(result, dict) else {"ok": False, "message": "确认弹窗状态未知"}
-        except Exception:
-            return {"ok": False, "message": "确认弹窗处理异常"}
+                )
+            except Exception as exc:
+                last_result = {"appeared": False, "confirmed": False, "message": f"交换手机确认弹窗处理异常：{exc}"}
+                self.check_stopped()
+                time.sleep(0.3)
+                continue
+            if isinstance(result, dict):
+                last_result = result
+                if result.get("appeared"):
+                    return result
+            else:
+                last_result = {"appeared": False, "confirmed": False, "message": "确认弹窗状态未知"}
+            self.check_stopped()
+            time.sleep(0.25)
+        return {
+            **last_result,
+            "appeared": bool(last_result.get("appeared")),
+            "confirmed": bool(last_result.get("confirmed")),
+            "message": f"等待交换手机确认弹窗超时：{last_result.get('message', '')}",
+        }
 
     def close_maimai_chat_tab_and_return(self, chat_tab, original_tab_id: str) -> None:
         try:

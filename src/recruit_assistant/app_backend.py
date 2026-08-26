@@ -629,6 +629,8 @@ class AppState:
         self.run_lock = threading.Lock()
         self.platform_open_lock = threading.Lock()
         self.logs: list[dict] = []
+        self.notifications: list[dict] = []
+        self.notification_seq = 0
         self.results: list[dict] = []
         self.running = False
         self.running_task = ""
@@ -688,6 +690,22 @@ class AppState:
             self.logs = self.logs[-500:]
             if event == "candidate_result":
                 self.results.append(data or {})
+
+    def notify(self, title: str, message: str, level: str = "info", data: dict | None = None) -> None:
+        """Queue a user-facing lifecycle notification for the web UI."""
+        with self.lock:
+            self.notification_seq += 1
+            self.notifications.append(
+                {
+                    "id": self.notification_seq,
+                    "title": title,
+                    "message": message,
+                    "level": level,
+                    "time": datetime.now().strftime("%H:%M:%S"),
+                    "data": data or {},
+                }
+            )
+            self.notifications = self.notifications[-50:]
 
     def progress(self, payload: dict) -> None:
         if isinstance(payload, dict):
@@ -798,6 +816,7 @@ class AppState:
                 "jobs": self.get_jobs(),
                 "platforms": list(PLATFORM_DEFS.values()),
                 "logs": self.logs[-250:],
+                "notifications": list(self.notifications),
                 "results": self.results[-200:],
                 "running": self.running,
                 "running_task": self.running_task,
@@ -869,7 +888,9 @@ class AppState:
     def run_task_async(self, task_id: str, reason: str = "手动运行") -> None:
         task = self.find_task(task_id)
         if not task:
-            self.add_log(f"任务不存在：{task_id}")
+            message = f"任务不存在：{task_id}"
+            self.add_log(message)
+            self.notify("任务未启动", message, "error")
             return
         thread = threading.Thread(target=self.run_task, args=(task_id, reason), daemon=True)
         thread.start()
@@ -883,7 +904,9 @@ class AppState:
     def refresh_jobs(self, platform: str, port: int) -> None:
         platform = normalize_platform(platform)
         if not self.run_lock.acquire(blocking=False):
-            self.add_log("当前有任务正在运行，暂不刷新职位。")
+            message = "当前有任务正在运行，暂不刷新职位。"
+            self.add_log(message)
+            self.notify("职位刷新未执行", message, "warning")
             return
         try:
             with self.lock:
@@ -900,9 +923,13 @@ class AppState:
                 raise RuntimeError(f"浏览器调试端口 {port} 未就绪，请确认自动化浏览器已打开。")
             page = LiepinSearchPage(port=port, stop_event=self.task_stop_event)
             jobs = page.fetch_job_list()
-            self.add_log(f"已获取 {len(jobs)} 个职位。")
+            message = f"已获取 {len(jobs)} 个职位。"
+            self.add_log(message)
+            self.notify("职位刷新完成", message, "success")
         except Exception as exc:
-            self.add_log(f"获取职位失败：{exc}")
+            message = f"获取职位失败：{exc}"
+            self.add_log(message)
+            self.notify("职位刷新中断", message, "error")
         finally:
             with self.lock:
                 self.running = False
@@ -913,11 +940,16 @@ class AppState:
 
     def run_task(self, task_id: str, reason: str) -> None:
         if not self.run_lock.acquire(blocking=False):
-            self.add_log(f"已有任务运行中，跳过：{reason}")
+            message = f"已有任务运行中，跳过：{reason}"
+            self.add_log(message)
+            self.notify("任务未启动", message, "warning")
             return
         task = self.find_task(task_id)
         if not task:
             self.run_lock.release()
+            message = f"任务不存在：{task_id}"
+            self.add_log(message)
+            self.notify("任务未启动", message, "error")
             return
         try:
             with self.lock:
@@ -966,13 +998,16 @@ class AppState:
                 task["last_status"] = summary
                 self.save()
             self.add_log(summary)
+            self.notify("任务完成", summary, "success", {"task_id": task_id})
         except Exception as exc:
             stopped = self.task_stop_event.is_set()
+            message = "任务已停止。" if stopped else f"任务中断：{exc}"
             with self.lock:
                 task["last_run_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 task["last_status"] = "已停止" if stopped else f"失败：{exc}"
                 self.save()
-            self.add_log("任务已停止。" if stopped else f"任务失败：{exc}")
+            self.add_log(message)
+            self.notify("任务已停止" if stopped else "任务中断", message, "warning" if stopped else "error", {"task_id": task_id})
         finally:
             with self.lock:
                 self.running = False

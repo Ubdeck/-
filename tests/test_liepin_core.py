@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import json
+import inspect
 import threading
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from recruit_assistant.environment import parse_env_file
-from recruit_assistant.app_backend import normalize_company_model, normalize_config, normalize_platform, platform_home_url
+from recruit_assistant.app_backend import AppState, normalize_company_model, normalize_config, normalize_platform, platform_home_url
 from recruit_assistant.model_config import messages_for_endpoint, resolve_model_endpoint
 from recruit_assistant.platforms.liepin.ai_matcher import AiMatcherMixin
 from recruit_assistant.platforms.liepin.browser import same_site_url
@@ -15,6 +17,7 @@ from recruit_assistant.platforms.liepin.constants import DEFAULT_MATCH_REQUIREME
 from recruit_assistant.platforms.liepin.filters import FilterMixin
 from recruit_assistant.platforms.liepin.models import BatchProgress, SearchFilters
 from recruit_assistant.platforms.maimai.ai_matcher import MaimaiAiMatcherMixin
+from recruit_assistant.platforms.maimai.automation import MaimaiRecruitPage
 from recruit_assistant.platforms.maimai.constants import DEFAULT_MAIMAI_MATCH_REQUIREMENTS, MAIMAI_TALENTS_URL
 
 
@@ -100,6 +103,79 @@ class LiepinCoreTests(unittest.TestCase):
         self.assertIn("本次搜索关键词", DEFAULT_MAIMAI_MATCH_REQUIREMENTS)
         self.assertNotIn("开聊职位", DEFAULT_MAIMAI_MATCH_REQUIREMENTS)
 
+    def test_maimai_phone_confirmation_accepts_a_timeout(self) -> None:
+        signature = inspect.signature(MaimaiRecruitPage.confirm_maimai_phone_request)
+        self.assertIn("timeout", signature.parameters)
+
+    def test_maimai_phone_status_recognizes_requested_and_available(self) -> None:
+        requested = MaimaiRecruitPage.read_maimai_phone_request_state("您向对方发起了交换手机号的申请", already=False)
+        available = MaimaiRecruitPage.read_maimai_phone_request_state("手机号已交换", already=True)
+        self.assertEqual(requested["status"], "requested")
+        self.assertEqual(available["status"], "already_available")
+
+    def test_maimai_phone_toolbar_states_do_not_trigger_duplicate_exchange(self) -> None:
+        class Frame:
+            def __init__(self, button_text: str) -> None:
+                self.button_text = button_text
+
+            def run_js(self, _script: str):
+                return {
+                    "ok": True,
+                    "state": "already_requested" if self.button_text == "申请中" else "already_available",
+                    "text": self.button_text,
+                    "message": "toolbar state",
+                }
+
+        for button_text, expected_status in (("申请中", "already_requested"), ("拨打电话", "already_available")):
+            page = object.__new__(MaimaiRecruitPage)
+            page.stop_event = None
+            with patch.object(page, "get_maimai_chat_frame", return_value=Frame(button_text)), patch.object(
+                page, "read_maimai_active_chat_text", return_value=""
+            ):
+                result = page.request_phone_in_maimai_chat(object(), timeout=0.1)
+            self.assertEqual(result["status"], expected_status)
+            self.assertEqual(result["data"]["button"]["text"], button_text)
+
+    def test_maimai_phone_exchange_succeeds_when_button_turns_pending(self) -> None:
+        class Frame:
+            def run_js(self, _script: str):
+                return {
+                    "ok": True,
+                    "clicked": True,
+                    "text": "交换手机",
+                    "class_name": "tool normal",
+                }
+
+        page = object.__new__(MaimaiRecruitPage)
+        page.stop_event = None
+        pending = {"status": "already_requested", "message": "按钮显示“申请中”。", "data": {"text": "申请中"}}
+        with patch.object(page, "get_maimai_chat_frame", return_value=Frame()), patch.object(
+            page, "read_maimai_active_chat_text", return_value=""
+        ), patch.object(page, "wait_for_maimai_phone_button_state", return_value=pending):
+            result = page.request_phone_in_maimai_chat(object(), timeout=0.1)
+        self.assertEqual(result["status"], "requested")
+        self.assertIn("按钮已变为“申请中”", result["message"])
+
+    def test_maimai_quick_reply_state_skips_communication(self) -> None:
+        class Page:
+            def run_js(self, _script: str, *_args):
+                return {
+                    "ok": True,
+                    "status": "quick_reply_skip",
+                    "text": "快捷回复",
+                    "message": "右侧按钮为“快捷回复”，说明候选人已投递职位，本次不触发立即沟通或交换手机。",
+                }
+
+        page = object.__new__(MaimaiRecruitPage)
+        page.page = Page()
+        page.stop_event = None
+        result = page.click_current_candidate_immediate_communicate("方封域", timeout=0.1)
+        self.assertEqual(result["status"], "quick_reply_skip")
+
+    def test_maimai_smoke_test_is_hard_bounded_to_five_candidates(self) -> None:
+        self.assertEqual(MaimaiRecruitPage.clean_optional_positive_int(5), 5)
+        self.assertEqual(max(1, min(int(99 or 5), 5)), 5)
+
     def test_liepin_and_maimai_ai_prompts_keep_different_shapes(self) -> None:
         requirements = "要有大客户销售经验，最好做过医疗行业"
         liepin_messages = AiMatcherMixin().build_match_messages(
@@ -157,6 +233,24 @@ class LiepinCoreTests(unittest.TestCase):
                 parse_env_file(path),
                 {"DEEPSEEK_API_KEY": "test-key", "EMPTY": ""},
             )
+
+    def test_app_state_queues_user_notifications(self) -> None:
+        state = AppState()
+        state.notify("任务完成", "已处理 2 人。", "success")
+        snapshot = state.snapshot()
+        self.assertEqual(snapshot["notifications"][-1]["title"], "任务完成")
+        self.assertEqual(snapshot["notifications"][-1]["message"], "已处理 2 人。")
+        self.assertEqual(snapshot["notifications"][-1]["level"], "success")
+
+    def test_task_failure_creates_interruption_notification(self) -> None:
+        state = AppState()
+        task = state.data["tasks"][0]
+        with patch("recruit_assistant.app_backend.ensure_debug_browser_for_work", return_value=False):
+            state.run_task(task["id"], "测试")
+        notification = state.snapshot()["notifications"][-1]
+        self.assertEqual(notification["title"], "任务中断")
+        self.assertIn("浏览器调试端口", notification["message"])
+        self.assertEqual(notification["level"], "error")
 
 
 if __name__ == "__main__":

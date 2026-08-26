@@ -196,6 +196,20 @@
   </main>
 </div>
 
+<div id="notificationOverlay" class="notification-overlay" role="dialog" aria-modal="true" aria-labelledby="notificationTitle" aria-describedby="notificationMessage" onclick="closeNotification(event)">
+  <div id="notificationModal" class="notification-modal" onclick="event.stopPropagation()">
+    <div class="notification-head">
+      <strong id="notificationTitle">任务状态</strong>
+      <button type="button" class="icon-button" onclick="closeNotification()" title="关闭">×</button>
+    </div>
+    <div id="notificationMessage" class="notification-message"></div>
+    <div class="notification-foot">
+      <span id="notificationTime" class="muted"></span>
+      <button type="button" onclick="closeNotification()">知道了</button>
+    </div>
+  </div>
+</div>
+
 <div id="industryPicker" class="picker-overlay" onclick="closeIndustryPicker(event)">
   <div class="industry-modal" onclick="event.stopPropagation()">
     <div class="industry-head">
