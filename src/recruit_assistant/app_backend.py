@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import ctypes
 import json
 import os
@@ -80,7 +81,11 @@ RUNTIME_DIR = APP_DIR / "runtime"
 CONFIG_PATH = RUNTIME_DIR / "recruit_assistant_config.json"
 LEGACY_CONFIG_PATH = RUNTIME_DIR / "liepin_web_config.json"
 DEFAULT_REQUIREMENTS = DEFAULT_MATCH_REQUIREMENTS
+DEFAULT_AI_TEMPLATE_ID = "general-screening"
 DEFAULT_BROWSER_PORT = 9225
+BROWSER_PORT_FALLBACKS = tuple(range(DEFAULT_BROWSER_PORT + 1, DEFAULT_BROWSER_PORT + 16))
+_active_browser_port = DEFAULT_BROWSER_PORT
+_active_browser_port_lock = threading.Lock()
 SEARCH_URL = LIEPIN_SEARCH_URL
 APP_NAME = "招聘工具"
 STARTUP_LOG_PATH = RUNTIME_DIR / "startup.log"
@@ -307,6 +312,33 @@ def debug_browser_ready_stable(port: int = DEFAULT_BROWSER_PORT, checks: int = 2
     return True
 
 
+def browser_port_candidates() -> list[int]:
+    """Return the managed debugging ports, with the documented default first."""
+    return [DEFAULT_BROWSER_PORT, *BROWSER_PORT_FALLBACKS]
+
+
+def active_browser_port() -> int:
+    with _active_browser_port_lock:
+        return _active_browser_port
+
+
+def set_active_browser_port(port: int) -> None:
+    global _active_browser_port
+    with _active_browser_port_lock:
+        _active_browser_port = int(port)
+
+
+def select_browser_port() -> int:
+    """Prefer an existing debug browser, otherwise choose the first free managed port."""
+    candidates = browser_port_candidates()
+    for candidate in candidates:
+        if debug_browser_ready_stable(port=candidate, checks=1, timeout=0.35):
+            return candidate
+        if not is_local_port_open(candidate):
+            return candidate
+    raise RuntimeError("默认浏览器调试端口和备用端口均不可用，请关闭占用 9225-9240 端口的程序后重试。")
+
+
 def profile_in_cmdline(profile_dir: Path, cmdline: list[str] | tuple[str, ...] | None) -> bool:
     needle = str(profile_dir).lower()
     return bool(needle and needle in " ".join(cmdline or []).lower())
@@ -473,18 +505,31 @@ def ensure_edge_debugging(port: int = DEFAULT_BROWSER_PORT, default_url: str | N
     verify_debug_browser_async(port)
 
 
-def ensure_debug_browser_for_work(port: int = DEFAULT_BROWSER_PORT, timeout: float = 35) -> bool:
-    if debug_browser_ready_stable(port=port, checks=2, interval=0.3, timeout=0.8):
-        return True
-    startup_log(f"work requested debug browser, launching port={port}")
-    ensure_edge_debugging(port)
+def ensure_debug_browser_for_work(
+    port: int | None = None,
+    timeout: float = 35,
+    default_url: str | None = None,
+) -> bool:
+    """Ensure a debug browser is ready, falling back when the preferred port is occupied."""
+    candidates = [int(port)] if port else browser_port_candidates()
     deadline = time.time() + timeout
-    while time.time() < deadline:
-        if debug_browser_ready_stable(port=port, checks=2, interval=0.3, timeout=0.8):
-            startup_log(f"debug browser ready for work on {port}")
+    for candidate in candidates:
+        if debug_browser_ready_stable(port=candidate, checks=2, interval=0.3, timeout=0.8):
+            set_active_browser_port(candidate)
             return True
-        time.sleep(0.5)
-    startup_log(f"debug browser not ready for work on {port} after {timeout}s")
+        if is_local_port_open(candidate):
+            startup_log(f"debug port {candidate} is occupied but is not a usable browser endpoint; trying fallback")
+            continue
+        startup_log(f"work requested debug browser, launching port={candidate}")
+        set_active_browser_port(candidate)
+        ensure_edge_debugging(candidate, default_url=default_url)
+        while time.time() < deadline:
+            if debug_browser_ready_stable(port=candidate, checks=2, interval=0.3, timeout=0.8):
+                startup_log(f"debug browser ready for work on {candidate}")
+                return True
+            time.sleep(0.5)
+        startup_log(f"debug browser not ready for work on {candidate} after {timeout}s")
+        break
     return False
 
 
@@ -553,6 +598,37 @@ FUNCTION_GROUPS = {
 }
 
 
+def default_ai_templates() -> list[dict]:
+    return [
+        {
+            "id": DEFAULT_AI_TEMPLATE_ID,
+            "name": "通用招聘筛选",
+            "description": "适合大多数职位，强调证据、硬性条件和谨慎通过。",
+            "prompt": """通用要求：
+1. 候选人的过往经历必须和目标岗位方向相关，优先看最近 5 年工作经历。
+2. 硬性条件必须有明确简历证据；信息缺失时不要脑补，按 unknown 处理。
+3. 城市、薪资、行业方向、岗位方向明显不匹配时不要通过。
+4. 软性偏好用于排序和说明，不要把“最好/优先”误判成硬性淘汰条件。
+5. 只有明确值得发起沟通时才返回 match=true。""",
+            "created_at": "",
+            "updated_at": "",
+        },
+        {
+            "id": "sales-screening",
+            "name": "销售岗位筛选",
+            "description": "优先识别企业端、大客户、渠道和可验证业绩经验。",
+            "prompt": """销售岗位要求：
+1. 必须有真实的销售、客户拓展、商务或客户成功经验，优先看最近 5 年。
+2. 企业端销售、行业客户、大客户、渠道、区域销售或团队管理经验是明显加分项。
+3. 尽量寻找客户类型、销售周期、客单价、业绩结果、负责区域或团队规模等证据。
+4. 只有“接触过销售”但没有职责或结果证据时要谨慎，信息缺失不要脑补。
+5. 城市、薪资、行业方向和目标岗位明显不匹配时不要通过；只有明确值得沟通时才返回 match=true。""",
+            "created_at": "",
+            "updated_at": "",
+        },
+    ]
+
+
 def default_filter_config() -> dict:
     return {
         "platform": "liepin",
@@ -597,6 +673,7 @@ def default_filter_config() -> dict:
         "deepseek_api_key": "",
         "company_model_api_key": "",
         "deepseek_model": DEFAULT_COMPANY_MODEL,
+        "ai_template_id": DEFAULT_AI_TEMPLATE_ID,
         "match_requirements": DEFAULT_REQUIREMENTS,
         "auto_communicate": True,
         "request_resume_after_communicate": True,
@@ -621,6 +698,17 @@ def new_task(name: str = "默认任务") -> dict:
         "last_status": "未运行",
         "last_runs": {},
     }
+
+
+def normalize_template(payload: dict) -> dict:
+    item = dict(payload or {})
+    item["id"] = str(item.get("id") or uuid.uuid4().hex[:12]).strip()
+    item["name"] = str(item.get("name") or "未命名模板").strip()[:80]
+    item["description"] = str(item.get("description") or "").strip()[:200]
+    item["prompt"] = str(item.get("prompt") or "").strip()[:20000]
+    item.setdefault("created_at", "")
+    item.setdefault("updated_at", "")
+    return item
 
 
 class AppState:
@@ -663,13 +751,25 @@ class AppState:
             merged_defaults.get("deepseek_model"),
         )
         data["defaults"] = merged_defaults
+        templates = [normalize_template(item) for item in (data.get("ai_templates") or []) if isinstance(item, dict)]
+        known_template_ids = {item["id"] for item in templates}
+        for template in default_ai_templates():
+            if template["id"] not in known_template_ids:
+                templates.append(normalize_template(template))
+        data["ai_templates"] = templates
         tasks = data.get("tasks") or []
         if not tasks:
             task = new_task()
             task["config"] = merged_defaults.copy()
             tasks = [task]
         for task in tasks:
-            task["config"] = normalize_config(task.get("config") or {})
+            raw_config = task.get("config") or {}
+            task["config"] = normalize_config(raw_config)
+            config = task["config"]
+            if "ai_template_id" not in raw_config:
+                config["ai_template_id"] = DEFAULT_AI_TEMPLATE_ID if config.get("match_requirements") == DEFAULT_REQUIREMENTS else ""
+            if config.get("ai_template_id") not in known_template_ids and config.get("ai_template_id") not in {item["id"] for item in templates}:
+                config["ai_template_id"] = ""
         data["tasks"] = tasks
         data.setdefault("active_task_id", tasks[0]["id"])
         return data
@@ -812,6 +912,7 @@ class AppState:
             return {
                 "defaults": self.data.get("defaults", {}),
                 "tasks": self.data.get("tasks", []),
+                "ai_templates": self.data.get("ai_templates", []),
                 "active_task_id": self.data.get("active_task_id", ""),
                 "jobs": self.get_jobs(),
                 "platforms": list(PLATFORM_DEFS.values()),
@@ -830,6 +931,78 @@ class AppState:
 
     def find_task(self, task_id: str) -> dict | None:
         return next((task for task in self.data.get("tasks", []) if task.get("id") == task_id), None)
+
+    def find_template(self, template_id: str) -> dict | None:
+        return next((item for item in self.data.get("ai_templates", []) if item.get("id") == template_id), None)
+
+    def save_ai_template(self, payload: dict) -> dict:
+        with self.lock:
+            if not str((payload or {}).get("name") or "").strip():
+                raise ValueError("模板名称不能为空。")
+            if not str((payload or {}).get("prompt") or "").strip():
+                raise ValueError("模板提示词不能为空。")
+            item = normalize_template(payload)
+            existing = self.find_template(item["id"])
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if existing:
+                item["created_at"] = existing.get("created_at") or now
+                item["updated_at"] = now
+                index = self.data["ai_templates"].index(existing)
+                self.data["ai_templates"][index] = item
+            else:
+                item["created_at"] = now
+                item["updated_at"] = now
+                self.data.setdefault("ai_templates", []).append(item)
+            self.save()
+            return item
+
+    def delete_ai_template(self, template_id: str) -> None:
+        with self.lock:
+            if not self.find_template(template_id):
+                return
+            if any((task.get("config") or {}).get("ai_template_id") == template_id for task in self.data.get("tasks", [])):
+                raise ValueError("该模板已被任务使用，请先将这些任务改为其他模板后再删除。")
+            if template_id == DEFAULT_AI_TEMPLATE_ID:
+                raise ValueError("系统内置模板不能删除。")
+            self.data["ai_templates"] = [item for item in self.data.get("ai_templates", []) if item.get("id") != template_id]
+            self.save()
+
+    def duplicate_task(self, task_id: str) -> dict:
+        with self.lock:
+            source = self.find_task(task_id)
+            if not source:
+                raise ValueError("任务不存在。")
+            task = copy.deepcopy(source)
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            task["id"] = uuid.uuid4().hex[:12]
+            task["name"] = f"{source.get('name') or '配置'} - 副本"
+            task["enabled"] = False
+            task["created_at"] = now
+            task["updated_at"] = now
+            task["last_run_at"] = ""
+            task["last_status"] = "未运行"
+            task["last_runs"] = {}
+            self.data["tasks"].append(task)
+            self.data["active_task_id"] = task["id"]
+            self.save()
+            return task
+
+    def toggle_task(self, task_id: str, enabled: bool) -> dict:
+        with self.lock:
+            task = self.find_task(task_id)
+            if not task:
+                raise ValueError("任务不存在。")
+            task["enabled"] = bool(enabled)
+            task["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.save()
+            return task
+
+    def apply_ai_template(self, config: dict) -> dict:
+        resolved = normalize_config(config)
+        template = self.find_template(str(resolved.get("ai_template_id") or ""))
+        if template:
+            resolved["match_requirements"] = template["prompt"]
+        return resolved
 
     def save_task(self, payload: dict) -> dict:
         with self.lock:
@@ -895,13 +1068,14 @@ class AppState:
         thread = threading.Thread(target=self.run_task, args=(task_id, reason), daemon=True)
         thread.start()
 
-    def refresh_jobs_async(self, port: int) -> None:
-        threading.Thread(target=self.refresh_jobs, args=(self.active_platform(), port), daemon=True).start()
+    def refresh_jobs_async(self, platform: str | None = None) -> None:
+        target_platform = normalize_platform(platform or self.active_platform())
+        threading.Thread(target=self.refresh_jobs, args=(target_platform,), daemon=True).start()
 
-    def open_platform_async(self, platform: str, port: int) -> None:
-        threading.Thread(target=self.open_platform, args=(platform, port), daemon=True).start()
+    def open_platform_async(self, platform: str) -> None:
+        threading.Thread(target=self.open_platform, args=(platform,), daemon=True).start()
 
-    def refresh_jobs(self, platform: str, port: int) -> None:
+    def refresh_jobs(self, platform: str) -> None:
         platform = normalize_platform(platform)
         if not self.run_lock.acquire(blocking=False):
             message = "当前有任务正在运行，暂不刷新职位。"
@@ -918,9 +1092,11 @@ class AppState:
                 self.add_log(f"{platform_name(platform)}职位列表刷新暂未接入，切换招聘渠道时会自动进入对应主界面。")
                 return
             self.add_log("正在获取猎聘职位列表...")
-            self.add_log(f"正在确认 {port} 浏览器调试端口...")
-            if not ensure_debug_browser_for_work(port):
-                raise RuntimeError(f"浏览器调试端口 {port} 未就绪，请确认自动化浏览器已打开。")
+            self.add_log("正在自动连接浏览器...")
+            if not ensure_debug_browser_for_work():
+                raise RuntimeError("浏览器调试端口未就绪：默认端口 9225 和备用端口均未能连接浏览器，请重试。")
+            port = active_browser_port()
+            self.add_log(f"已连接浏览器调试端口：{port}")
             page = LiepinSearchPage(port=port, stop_event=self.task_stop_event)
             jobs = page.fetch_job_list()
             message = f"已获取 {len(jobs)} 个职位。"
@@ -960,11 +1136,13 @@ class AppState:
                 self.results = []
             self.add_log(f"开始运行任务：{task.get('name', '')}（{reason}）")
             config = normalize_config(task.get("config") or {})
-            port = int(config.get("port") or DEFAULT_BROWSER_PORT)
+            config = self.apply_ai_template(config)
             platform = normalize_platform(config.get("platform"))
-            self.add_log(f"正在确认 {port} 浏览器调试端口...")
-            if not ensure_debug_browser_for_work(port):
-                raise RuntimeError(f"浏览器调试端口 {port} 未就绪，请确认自动化浏览器已打开。")
+            self.add_log("正在自动连接浏览器...")
+            if not ensure_debug_browser_for_work():
+                raise RuntimeError("浏览器调试端口未就绪：默认端口 9225 和备用端口均未能连接浏览器，请重试。")
+            port = active_browser_port()
+            self.add_log(f"已连接浏览器调试端口：{port}")
             if platform == "liepin":
                 filters, _port = build_filters(config)
                 page = LiepinSearchPage(port=port, progress_callback=self.progress, stop_event=self.task_stop_event)
@@ -1050,7 +1228,7 @@ class AppState:
         self.add_log(f"正在停止当前任务：{running_task or '未命名任务'}")
         return True
 
-    def open_platform(self, platform: str, port: int) -> None:
+    def open_platform(self, platform: str) -> None:
         platform = normalize_platform(platform)
         target_url = platform_home_url(platform)
         current_platform_name = platform_name(platform)
@@ -1062,8 +1240,9 @@ class AppState:
             return
         try:
             self.add_log(f"正在打开{current_platform_name}初始页面：{target_url}")
-            if not ensure_debug_browser_for_work(port):
-                raise RuntimeError(f"浏览器调试端口 {port} 未就绪。")
+            if not ensure_debug_browser_for_work(default_url=target_url):
+                raise RuntimeError("浏览器调试端口未就绪：默认端口 9225 和备用端口均未能连接浏览器。")
+            port = active_browser_port()
             connect_platform_page(target_url, port)
             self.add_log(f"已切换当前页面到{current_platform_name}。")
         except Exception as exc:
@@ -1107,10 +1286,8 @@ def normalize_config(config: dict) -> dict:
         base.get("deepseek_model"),
     )
     base["platform"] = normalize_platform(base.get("platform"))
-    try:
-        base["port"] = int(base.get("port") or DEFAULT_BROWSER_PORT)
-    except (TypeError, ValueError):
-        base["port"] = DEFAULT_BROWSER_PORT
+    # Browser debugging is managed centrally; keep the legacy field normalized for old config files.
+    base["port"] = DEFAULT_BROWSER_PORT
     try:
         base["candidate_limit"] = max(int(base.get("candidate_limit") or 1), 1)
     except (TypeError, ValueError):
@@ -1232,6 +1409,30 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/tasks/delete":
             STATE.delete_task(str(payload.get("id") or ""))
             self.send_json({"ok": True})
+        elif path == "/api/tasks/duplicate":
+            try:
+                task = STATE.duplicate_task(str(payload.get("id") or ""))
+                self.send_json({"ok": True, "task": task})
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+        elif path == "/api/tasks/toggle":
+            try:
+                task = STATE.toggle_task(str(payload.get("id") or ""), bool(payload.get("enabled")))
+                self.send_json({"ok": True, "task": task})
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+        elif path == "/api/ai-templates/save":
+            try:
+                template = STATE.save_ai_template(payload)
+                self.send_json({"ok": True, "template": template})
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+        elif path == "/api/ai-templates/delete":
+            try:
+                STATE.delete_ai_template(str(payload.get("id") or ""))
+                self.send_json({"ok": True})
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
         elif path == "/api/tasks/active":
             STATE.set_active(str(payload.get("id") or ""))
             self.send_json({"ok": True})
@@ -1242,14 +1443,12 @@ class Handler(BaseHTTPRequestHandler):
             stopped = STATE.stop_current_task()
             self.send_json({"ok": True, "stopped": stopped})
         elif path == "/api/jobs/refresh":
-            port = int(payload.get("port") or DEFAULT_BROWSER_PORT)
             platform = normalize_platform(payload.get("platform") or STATE.active_platform())
-            threading.Thread(target=STATE.refresh_jobs, args=(platform, port), daemon=True).start()
+            STATE.refresh_jobs_async(platform)
             self.send_json({"ok": True})
         elif path == "/api/platform/open":
-            port = int(payload.get("port") or DEFAULT_BROWSER_PORT)
             platform = normalize_platform(payload.get("platform") or STATE.active_platform())
-            STATE.open_platform_async(platform, port)
+            STATE.open_platform_async(platform)
             self.send_json({"ok": True})
         elif path == "/api/update/check":
             result = check_for_update()
@@ -1295,7 +1494,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def start_server(host: str = "127.0.0.1", port: int = 8765, open_browser: bool = False) -> tuple[ThreadingHTTPServer, str]:
-    ensure_edge_debugging(DEFAULT_BROWSER_PORT, default_url=platform_home_url(STATE.active_platform()))
+    startup_port = select_browser_port()
+    set_active_browser_port(startup_port)
+    ensure_edge_debugging(startup_port, default_url=platform_home_url(STATE.active_platform()))
     threading.Thread(target=STATE.scheduler_loop, daemon=True).start()
     server = ThreadingHTTPServer((host, port), Handler)
     url = f"http://{host}:{port}"

@@ -9,7 +9,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from recruit_assistant.environment import parse_env_file
-from recruit_assistant.app_backend import AppState, normalize_company_model, normalize_config, normalize_platform, platform_home_url
+from recruit_assistant.app_backend import AppState, DEFAULT_AI_TEMPLATE_ID, browser_port_candidates, default_ai_templates, normalize_company_model, normalize_config, normalize_platform, platform_home_url, select_browser_port
 from recruit_assistant.model_config import messages_for_endpoint, resolve_model_endpoint
 from recruit_assistant.platforms.liepin.ai_matcher import AiMatcherMixin
 from recruit_assistant.platforms.liepin.browser import same_site_url
@@ -40,6 +40,20 @@ class LiepinCoreTests(unittest.TestCase):
         self.assertEqual(normalize_platform("liepin"), "liepin")
         self.assertEqual(normalize_platform("maimai"), "maimai")
         self.assertEqual(normalize_platform("unknown"), "liepin")
+
+    def test_browser_port_candidates_keep_9225_first(self) -> None:
+        candidates = browser_port_candidates()
+        self.assertEqual(candidates[0], 9225)
+        self.assertIn(9226, candidates)
+
+    def test_browser_port_falls_back_to_ready_debug_endpoint(self) -> None:
+        with patch("recruit_assistant.app_backend.debug_browser_ready_stable", side_effect=lambda port, **_kwargs: port == 9226), patch(
+            "recruit_assistant.app_backend.is_local_port_open", return_value=True
+        ):
+            self.assertEqual(select_browser_port(), 9226)
+
+    def test_normalize_config_hides_legacy_custom_browser_port(self) -> None:
+        self.assertEqual(normalize_config({"port": 9333})["port"], 9225)
 
     def test_old_deepseek_model_config_keeps_deepseek_provider(self) -> None:
         self.assertEqual(normalize_company_model("deepseek-chat"), "minimax")
@@ -241,6 +255,31 @@ class LiepinCoreTests(unittest.TestCase):
         self.assertEqual(snapshot["notifications"][-1]["title"], "任务完成")
         self.assertEqual(snapshot["notifications"][-1]["message"], "已处理 2 人。")
         self.assertEqual(snapshot["notifications"][-1]["level"], "success")
+
+    def test_default_ai_templates_include_sales_template(self) -> None:
+        templates = default_ai_templates()
+        self.assertEqual(templates[0]["id"], DEFAULT_AI_TEMPLATE_ID)
+        sales = next(item for item in templates if item["id"] == "sales-screening")
+        self.assertIn("大客户", sales["prompt"])
+
+    def test_ai_template_is_applied_at_run_time(self) -> None:
+        state = AppState()
+        state.data["ai_templates"] = default_ai_templates()
+        result = state.apply_ai_template({"ai_template_id": "sales-screening", "match_requirements": "旧提示词"})
+        self.assertIn("大客户", result["match_requirements"])
+
+    def test_duplicate_task_is_disabled_and_keeps_template(self) -> None:
+        state = AppState()
+        source = state.data["tasks"][0]
+        source["name"] = "销售筛选"
+        source["enabled"] = True
+        source["config"]["ai_template_id"] = "sales-screening"
+        with patch.object(state, "save"):
+            duplicate = state.duplicate_task(source["id"])
+        self.assertNotEqual(duplicate["id"], source["id"])
+        self.assertEqual(duplicate["name"], "销售筛选 - 副本")
+        self.assertFalse(duplicate["enabled"])
+        self.assertEqual(duplicate["config"]["ai_template_id"], "sales-screening")
 
     def test_task_failure_creates_interruption_notification(self) -> None:
         state = AppState()

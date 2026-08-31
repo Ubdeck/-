@@ -17,7 +17,9 @@
       <button class="ghost" onclick="newTask()">新建配置</button>
       <button class="ghost" onclick="deleteTask()">删除配置</button>
     </div>
+    <div class="side-section-title"><span>我的配置</span><span id="taskCount" class="side-count">0</span></div>
     <div id="taskList" class="task-list"></div>
+    <div class="side-tip">每套配置可以绑定不同渠道、筛选条件、运行时间和 AI 模板。复制一套配置后再微调，适合快速建立多个招聘场景。</div>
   </aside>
   <main>
     <div class="topbar">
@@ -45,9 +47,7 @@
       <section class="card span-8">
         <h3>基础筛选</h3>
         <div class="fields">
-          <div><label>配置名称</label><input id="taskName" /></div>
           <div><label>招聘渠道</label><select id="platform" onchange="onPlatformChange()"><option value="liepin">猎聘</option><option value="maimai">脉脉</option></select></div>
-          <div><label>浏览器端口</label><input id="port" type="number" min="1" /></div>
         </div>
         <div id="liepinPanel" class="platform-panel fields" style="margin-top:12px">
           <div class="field full"><label>开聊职位</label><select id="selected_chat_job"></select></div>
@@ -171,9 +171,14 @@
             </div>
           </div>
           <div id="aiRequirementPanel" class="field full platform-panel">
-            <label>AI筛选要求</label>
-            <textarea id="match_requirements" placeholder="例如：要有销售经验，最好做过医疗行业，成都优先，薪资别太离谱。留空则使用默认通用要求。"></textarea>
-            <div class="hint"></div>
+            <div class="template-heading">
+              <label for="ai_template_id">AI筛选模板</label>
+              <button type="button" class="secondary compact-button" onclick="openTemplateManager()">管理模板</button>
+            </div>
+            <select id="ai_template_id" onchange="onTemplateChange()"></select>
+            <div id="templateHint" class="hint"></div>
+            <label for="match_requirements" class="prompt-label">本任务提示词</label>
+            <textarea id="match_requirements" oninput="onPromptInput()" placeholder="选择模板后自动带入模板提示词；也可以直接修改，修改后会转为本任务自定义。"></textarea>
           </div>
         </div>
       </section>
@@ -223,6 +228,35 @@
     <div class="industry-foot">
       <div id="industrySelected" class="industry-selected"></div>
       <button type="button" onclick="confirmIndustryPicker()">确认</button>
+    </div>
+  </div>
+</div>
+
+<div id="templateManager" class="picker-overlay" onclick="closeTemplateManager(event)">
+  <div class="template-modal" onclick="event.stopPropagation()">
+    <div class="industry-head">
+      <strong>AI 筛选模板</strong>
+      <button type="button" class="icon-button" onclick="closeTemplateManager()">×</button>
+    </div>
+    <div class="template-manager-body">
+      <div class="template-list-pane">
+        <div class="template-list-head">
+          <span class="muted">已保存模板</span>
+          <button type="button" class="secondary compact-button" onclick="newTemplateDraft()">新建模板</button>
+        </div>
+        <div id="templateManagerList" class="template-manager-list"></div>
+      </div>
+      <div class="template-editor">
+        <div class="fields">
+          <div class="field full"><label for="templateName">模板名称</label><input id="templateName" placeholder="例如：医疗行业大客户销售" /></div>
+          <div class="field full"><label for="templateDescription">用途说明 <span class="muted">（可选）</span></label><input id="templateDescription" placeholder="一句话说明适用场景，方便团队识别" /></div>
+          <div class="field full"><label for="templatePrompt">模板提示词</label><textarea id="templatePrompt" class="template-prompt" placeholder="描述硬性条件、优先条件、风险判断和通过标准"></textarea></div>
+        </div>
+        <div class="template-editor-foot">
+          <span id="templateEditorHint" class="hint">模板会自动保存到本机，绑定它的任务运行时使用最新内容。</span>
+          <div class="template-editor-actions"><button type="button" class="danger" onclick="deleteTemplateDraft()">删除</button><button type="button" onclick="saveTemplateDraft()">保存模板</button></div>
+        </div>
+      </div>
     </div>
   </div>
 </div>

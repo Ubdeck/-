@@ -13,16 +13,18 @@ let refreshJobsTimer = null;
 let updatePollTimer = null;
 let notificationQueue = [];
 let notificationOpen = false;
+let customMatchRequirements = "";
+let templateDraftId = "";
 const handledNotificationIds = new Set();
 const fieldIds = [
   "platform",
-  "port", "keywords", "job_name", "company_name", "current_city", "expected_city",
+  "keywords", "job_name", "company_name", "current_city", "expected_city",
   "maimai_keywords", "maimai_keyword_mode", "maimai_city", "maimai_education", "maimai_experience", "maimai_graduation_year",
   "maimai_company", "maimai_gender", "maimai_age_min", "maimai_age_max", "maimai_greeting",
   "experience", "recruitment_type", "active_status", "job_status",
   "job_hop_frequency", "age_min", "age_max", "gender_requirement", "language_requirement",
   "graduation_year", "ai_provider", "deepseek_api_key", "company_model_api_key", "deepseek_model",
-  "candidate_limit", "maimai_page_limit", "maimai_auto_communicate", "match_requirements",
+  "candidate_limit", "maimai_page_limit", "maimai_auto_communicate", "ai_template_id", "match_requirements",
   "use_keywords_ai_words", "use_job_ai_words", "use_company_ai_words", "auto_communicate",
   "request_resume_after_communicate", "request_phone_after_communicate"
 ];
@@ -35,7 +37,9 @@ function escapeHtml(value) {
 }
 async function api(path, payload) {
   const res = await fetch(path, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload || {})});
-  return await res.json();
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || "操作失败");
+  return data;
 }
 async function loadState(keepForm = false) {
   const res = await fetch("/api/state");
@@ -74,15 +78,27 @@ function platformMeta(platform = currentPlatform()) {
 }
 function renderTasks() {
   const box = document.getElementById("taskList");
+  const count = document.getElementById("taskCount");
+  if (count) count.textContent = String((state.tasks || []).length);
   box.innerHTML = (state.tasks || []).map(task => `
-    <div class="task ${task.id === activeTaskId ? "active" : ""}" onclick="selectTask('${task.id}')">
-      <div class="task-name">${escapeHtml(task.name)}</div>
+    <div class="task ${task.id === activeTaskId ? "active" : ""}" onclick="selectTask('${escapeJs(task.id)}')">
+      <div class="task-topline"><div class="task-name">${escapeHtml(task.name)}</div><span class="task-dot ${task.enabled ? "on" : ""}" title="${task.enabled ? "已启用定时" : "未启用定时"}"></span></div>
       <div class="task-meta">
-        ${task.enabled ? "已启用" : "未启用"} · ${(task.times || []).join(", ") || "未设时间"}<br>
-        ${escapeHtml(task.last_status || "未运行")}
+        <span class="task-platform">${escapeHtml(platformMeta((task.config || {}).platform).name)}</span>
+        · ${task.enabled ? "已启用" : "未启用"} · ${(task.times || []).join(", ") || "未设时间"}<br>
+      </div>
+      <div class="task-actions">
+        <button type="button" class="task-action" onclick="event.stopPropagation(); renameTask('${escapeJs(task.id)}')">重命名</button>
+        <button type="button" class="task-action" onclick="event.stopPropagation(); duplicateTask('${escapeJs(task.id)}')">复制</button>
+        <button type="button" class="task-action" onclick="event.stopPropagation(); toggleTask('${escapeJs(task.id)}', ${!task.enabled})">${task.enabled ? "停用" : "启用"}</button>
       </div>
     </div>
   `).join("");
+}
+function templateName(task) {
+  const id = task?.config?.ai_template_id;
+  const template = (state.ai_templates || []).find(item => item.id === id);
+  return template ? template.name : "本任务自定义提示词";
 }
 function fillSelect(id, selected) {
   document.getElementById(id).innerHTML = optionHtml(state.options[id] || [""], selected || "");
@@ -147,11 +163,11 @@ function renderJobSelect(cfg = null) {
 function fillForm(task) {
   if (!task) return;
   const cfg = {...state.defaults, ...(task.config || {})};
-  document.getElementById("taskName").value = task.name || "";
   document.getElementById("enabled").checked = !!task.enabled;
   scheduleTimes = normalizeTimes(task.times || []);
   renderScheduleTimes();
   for (const id of Object.keys(state.options || {})) fillSelect(id, cfg[id]);
+  customMatchRequirements = cfg.ai_template_id ? "" : (cfg.match_requirements || "").trim();
   renderCheckboxGroup("education", state.options.education || [], cfg.education || []);
   renderJobSelect(cfg);
   const schools = ["211", "985", "双一流", "海外留学"];
@@ -166,6 +182,8 @@ function fillForm(task) {
     else if (id === "match_requirements" && (cfg[id] || "").trim() === (state.defaults.match_requirements || "").trim()) ele.value = "";
     else ele.value = cfg[id] ?? "";
   }
+  renderTemplateSelect(cfg);
+  applyTemplateUI();
   currentIndustries = normalizeIndustries(cfg.current_industries || []);
   expectedIndustries = normalizeIndustries(cfg.expected_industries || []);
   currentFunctions = normalizeIndustries(cfg.current_functions || []);
@@ -180,8 +198,12 @@ function readForm() {
     if (!ele) continue;
     cfg[id] = ele.type === "checkbox" ? ele.checked : ele.value;
   }
-  cfg.port = Number(cfg.port || 9225);
   cfg.platform = currentPlatform();
+  cfg.ai_template_id = document.getElementById("ai_template_id")?.value || "";
+  if (cfg.ai_template_id) {
+    const template = (state.ai_templates || []).find(item => item.id === cfg.ai_template_id);
+    if (template) cfg.match_requirements = template.prompt;
+  }
   cfg.candidate_limit = Number(cfg.candidate_limit || 1);
   cfg.maimai_page_limit = Number(cfg.maimai_page_limit || 1);
   cfg.school_types = Array.from(document.querySelectorAll("#school_types input:checked")).map(x => x.value);
@@ -196,11 +218,127 @@ function readForm() {
     : null;
   return {
     id: activeTaskId || undefined,
-    name: document.getElementById("taskName").value.trim() || "未命名任务",
+    name: activeTask()?.name || "未命名任务",
     enabled: document.getElementById("enabled").checked,
     times: scheduleTimes,
     config: cfg
   };
+}
+function renderTemplateSelect(cfg = {}) {
+  const select = document.getElementById("ai_template_id");
+  if (!select) return;
+  const selected = cfg.ai_template_id || "";
+  select.innerHTML = `<option value="">本任务自定义提示词</option>` + (state.ai_templates || []).map(item =>
+    `<option value="${escapeHtml(item.id)}"${item.id === selected ? " selected" : ""}>${escapeHtml(item.name)}</option>`
+  ).join("");
+}
+function applyTemplateUI() {
+  const select = document.getElementById("ai_template_id");
+  const prompt = document.getElementById("match_requirements");
+  const hint = document.getElementById("templateHint");
+  if (!select || !prompt) return;
+  const template = (state.ai_templates || []).find(item => item.id === select.value);
+  prompt.disabled = false;
+  if (template) {
+    prompt.value = template.prompt || "";
+    if (hint) hint.textContent = `${template.description || "已绑定模板"} 可直接修改本框，修改后会转为本任务自定义，不影响共享模板。`;
+  } else {
+    prompt.value = customMatchRequirements || "";
+    if (hint) hint.textContent = "本任务独立使用下面的提示词，不会影响其他任务。";
+  }
+}
+function onPromptInput() {
+  const select = document.getElementById("ai_template_id");
+  const prompt = document.getElementById("match_requirements");
+  if (!select || !prompt || !select.value) return;
+  customMatchRequirements = prompt.value;
+  select.value = "";
+  applyTemplateUI();
+}
+function onTemplateChange() {
+  const prompt = document.getElementById("match_requirements");
+  if (prompt && !prompt.disabled && prompt.value.trim()) customMatchRequirements = prompt.value.trim();
+  applyTemplateUI();
+}
+function openTemplateManager() {
+  document.getElementById("templateManager").classList.add("open");
+  const selected = document.getElementById("ai_template_id")?.value;
+  templateDraftId = selected || (state.ai_templates?.[0]?.id || "");
+  renderTemplateManager();
+}
+function closeTemplateManager(event) {
+  if (event && event.target && event.target.id !== "templateManager") return;
+  document.getElementById("templateManager").classList.remove("open");
+}
+function renderTemplateManager() {
+  const list = document.getElementById("templateManagerList");
+  if (!list) return;
+  list.innerHTML = (state.ai_templates || []).map(item => `
+    <button type="button" class="template-list-item ${item.id === templateDraftId ? "active" : ""}" onclick="selectTemplateDraft('${escapeJs(item.id)}')">
+      <strong>${escapeHtml(item.name)}</strong><span>${escapeHtml(item.description || "暂无用途说明")}</span>
+    </button>`).join("") || `<div class="hint">还没有模板，请新建一个。</div>`;
+  const item = (state.ai_templates || []).find(value => value.id === templateDraftId);
+  document.getElementById("templateName").value = item?.name || "";
+  document.getElementById("templateDescription").value = item?.description || "";
+  document.getElementById("templatePrompt").value = item?.prompt || "";
+  const hint = document.getElementById("templateEditorHint");
+  if (hint) hint.textContent = item ? `${templateUsageCount(item.id)} 套任务正在使用此模板。更新后立即生效。` : "新模板保存后即可绑定到任务。";
+}
+function templateUsageCount(id) {
+  return `${(state.tasks || []).filter(task => task.config?.ai_template_id === id).length}`;
+}
+function selectTemplateDraft(id) {
+  templateDraftId = id;
+  renderTemplateManager();
+}
+function newTemplateDraft() {
+  templateDraftId = "";
+  document.getElementById("templateName").value = "";
+  document.getElementById("templateDescription").value = "";
+  document.getElementById("templatePrompt").value = "";
+  document.getElementById("templateEditorHint").textContent = "新模板保存后即可绑定到任务。";
+  document.querySelectorAll(".template-list-item").forEach(item => item.classList.remove("active"));
+}
+async function saveTemplateDraft() {
+  const name = document.getElementById("templateName").value.trim();
+  const prompt = document.getElementById("templatePrompt").value.trim();
+  if (!name || !prompt) { alert("请填写模板名称和提示词。\n\n提示词至少要包含你的筛选标准和通过条件。"); return; }
+  const selectedTemplateId = document.getElementById("ai_template_id")?.value || "";
+  const result = await api("/api/ai-templates/save", {id: templateDraftId || undefined, name, description: document.getElementById("templateDescription").value.trim(), prompt});
+  templateDraftId = result.template.id;
+  await loadState(true);
+  renderTemplateManager();
+  renderTemplateSelect({ai_template_id: selectedTemplateId});
+  applyTemplateUI();
+  alert("模板已保存。已绑定该模板的任务会在下次运行时使用最新提示词。");
+}
+async function deleteTemplateDraft() {
+  const item = (state.ai_templates || []).find(value => value.id === templateDraftId);
+  if (!item) return;
+  if (!confirm(`确定删除模板“${item.name}”？`)) return;
+  await api("/api/ai-templates/delete", {id: item.id});
+  templateDraftId = state.ai_templates.find(value => value.id !== item.id)?.id || "";
+  await loadState(true);
+  renderTemplateSelect(activeTask()?.config || {});
+  applyTemplateUI();
+  renderTemplateManager();
+}
+async function renameTask(id) {
+  const task = (state.tasks || []).find(item => item.id === id);
+  if (!task) return;
+  const name = prompt("请输入新的配置名称", task.name || "");
+  if (name === null || !name.trim()) return;
+  await api("/api/tasks/save", {id, name: name.trim(), enabled: task.enabled, times: task.times, config: task.config});
+  await loadState(true);
+}
+async function duplicateTask(id) {
+  const result = await api("/api/tasks/duplicate", {id});
+  activeTaskId = result.task.id;
+  await loadState(false);
+}
+async function toggleTask(id, enabled) {
+  await api("/api/tasks/toggle", {id, enabled});
+  await loadState(true);
 }
 function normalizeIndustries(values) {
   const raw = Array.isArray(values) ? values : String(values || "").split(/[，,、;；]/);
@@ -420,13 +558,11 @@ async function onPlatformChange() {
 }
 async function openPlatform() {
   await saveTask();
-  const port = Number(document.getElementById("port").value || 9225);
-  await api("/api/platform/open", {port, platform: currentPlatform()});
+  await api("/api/platform/open", {platform: currentPlatform()});
   setTimeout(() => loadState(true), 500);
 }
 async function refreshJobs() {
-  const port = Number(document.getElementById("port").value || 9225);
-  await api("/api/jobs/refresh", {port, platform: currentPlatform()});
+  await api("/api/jobs/refresh", {platform: currentPlatform()});
   if (refreshJobsTimer) clearInterval(refreshJobsTimer);
   const startedAt = Date.now();
   refreshJobsTimer = setInterval(async () => {
