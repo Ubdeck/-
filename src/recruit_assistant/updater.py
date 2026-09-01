@@ -173,22 +173,11 @@ def powershell_executable() -> str:
     return str(candidate if candidate.exists() else "powershell.exe")
 
 
-def wscript_executable() -> str:
-    system_root = Path(os.environ.get("SystemRoot") or r"C:\Windows")
-    candidate = system_root / "System32" / "wscript.exe"
-    return str(candidate if candidate.exists() else "wscript.exe")
-
-
-def vbs_string(value: str) -> str:
-    return '"' + str(value).replace('"', '""') + '"'
-
-
 def launch_update_installer_and_exit(downloaded_exe: Path, app_name: str) -> None:
     target_exe = current_executable()
     if target_exe is None:
         raise RuntimeError("当前是源码运行模式，只有打包后的 exe 支持一键安装更新。")
     script = downloaded_exe.parent / "install_update.ps1"
-    launcher = downloaded_exe.parent / "install_update.vbs"
     log_path = downloaded_exe.parent / "install_update.log"
     log_path.write_text(
         f"{time.strftime('%Y-%m-%d %H:%M:%S')} launcher prepared source={downloaded_exe} target={target_exe}\n",
@@ -286,32 +275,32 @@ try {
 '''.strip(),
         encoding="utf-8",
     )
-    command = " ".join(
-        [
-            vbs_string(powershell_executable()),
-            "-NoProfile",
-            "-ExecutionPolicy Bypass",
-            "-WindowStyle Hidden",
-            "-File",
-            vbs_string(str(script)),
-            vbs_string(str(os.getpid())),
-            vbs_string(str(downloaded_exe)),
-            vbs_string(str(target_exe)),
-            vbs_string(str(log_path)),
-        ]
-    )
-    launcher.write_text(
-        "\n".join(
-            [
-                'Set shell = CreateObject("WScript.Shell")',
-                f"shell.CurrentDirectory = {vbs_string(str(target_exe.parent))}",
-                f"shell.Run {vbs_string(command)}, 0, False",
-            ]
-        ),
-        encoding="utf-16",
-    )
     if os.name == "nt":
-        os.startfile(str(launcher))  # type: ignore[attr-defined]
+        # Start PowerShell directly. The former VBS -> shell.Run hop is blocked by
+        # Windows Script Host policies on some machines with error 800A0046.
+        creation_flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        subprocess.Popen(
+            [
+                powershell_executable(),
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-WindowStyle",
+                "Hidden",
+                "-File",
+                str(script),
+                str(os.getpid()),
+                str(downloaded_exe),
+                str(target_exe),
+                str(log_path),
+            ],
+            cwd=str(target_exe.parent),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            creationflags=creation_flags,
+        )
     else:
         subprocess.Popen([powershell_executable(), "-File", str(script)], cwd=str(target_exe.parent))
     time.sleep(1.0)
