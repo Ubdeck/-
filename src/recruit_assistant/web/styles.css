@@ -194,7 +194,7 @@ input, select, textarea {
 }
 #platform,
 #platform option {
-  color: #dc2626;
+  color: #111827;
   font-weight: 800;
 }
 textarea { min-height: 126px; resize: vertical; line-height: 1.55; }
