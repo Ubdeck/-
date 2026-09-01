@@ -19,6 +19,7 @@ from recruit_assistant.platforms.liepin.models import BatchProgress, SearchFilte
 from recruit_assistant.platforms.maimai.ai_matcher import MaimaiAiMatcherMixin
 from recruit_assistant.platforms.maimai.automation import MaimaiRecruitPage
 from recruit_assistant.platforms.maimai.constants import DEFAULT_MAIMAI_MATCH_REQUIREMENTS, MAIMAI_TALENTS_URL
+from recruit_assistant.updater import install_downloaded_update, launch_update_installer_and_exit
 
 
 class LiepinCoreTests(unittest.TestCase):
@@ -247,6 +248,42 @@ class LiepinCoreTests(unittest.TestCase):
                 parse_env_file(path),
                 {"DEEPSEEK_API_KEY": "test-key", "EMPTY": ""},
             )
+
+    def test_self_update_installer_replaces_target_without_scripts(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "runtime" / "updates" / "RecruitTool.exe"
+            target = root / "招聘工具.exe"
+            log_path = source.parent / "install_update.log"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"MZ-new-version")
+            target.write_bytes(b"MZ-old-version")
+            result = install_downloaded_update(source, target, 999999, log_path)
+            self.assertEqual(result, 0)
+            self.assertEqual(target.read_bytes(), b"MZ-new-version")
+            self.assertEqual(target.with_suffix(".exe.bak").read_bytes(), b"MZ-old-version")
+            self.assertFalse((source.parent / "install_update.ps1").exists())
+            self.assertFalse((source.parent / "install_update.vbs").exists())
+
+    def test_update_launcher_starts_downloaded_executable_directly(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "updates" / "RecruitTool.exe"
+            target = root / "招聘工具.exe"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"MZ-new-version")
+            target.write_bytes(b"MZ-old-version")
+            with patch("recruit_assistant.updater.current_executable", return_value=target), patch(
+                "recruit_assistant.updater.subprocess.Popen"
+            ) as popen, patch("recruit_assistant.updater.time.sleep"), patch(
+                "recruit_assistant.updater.os._exit", side_effect=SystemExit
+            ):
+                with self.assertRaises(SystemExit):
+                    launch_update_installer_and_exit(source, "招聘工具")
+            command = popen.call_args.args[0]
+            self.assertEqual(command[0], str(source))
+            self.assertIn("--install-update", command)
+            self.assertNotIn("powershell", " ".join(command).lower())
 
     def test_app_state_queues_user_notifications(self) -> None:
         state = AppState()

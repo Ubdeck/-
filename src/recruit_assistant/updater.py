@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -10,6 +11,8 @@ import urllib.request
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
+
+import psutil
 
 from .version import APP_VERSION, GITHUB_REPO
 
@@ -167,141 +170,105 @@ def current_executable() -> Path | None:
     return None
 
 
-def powershell_executable() -> str:
-    system_root = Path(os.environ.get("SystemRoot") or r"C:\Windows")
-    candidate = system_root / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
-    return str(candidate if candidate.exists() else "powershell.exe")
+def append_install_log(log_path: Path, message: str) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as file:
+        file.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
+
+
+def target_executable_processes(target_exe: Path) -> list[psutil.Process]:
+    target = str(target_exe.resolve()).casefold()
+    processes: list[psutil.Process] = []
+    for process in psutil.process_iter(["pid", "exe"]):
+        try:
+            if process.pid != os.getpid() and str(process.info.get("exe") or "").casefold() == target:
+                processes.append(process)
+        except (psutil.Error, OSError):
+            continue
+    return processes
+
+
+def install_downloaded_update(source_exe: Path, target_exe: Path, target_pid: int, log_path: Path) -> int:
+    """Run inside the downloaded executable and replace the previous executable."""
+    source_exe = source_exe.resolve()
+    target_exe = target_exe.resolve()
+    log_path = log_path.resolve()
+    append_install_log(log_path, f"self installer start pid={target_pid} source={source_exe} target={target_exe}")
+    if source_exe == target_exe or source_exe.suffix.lower() != ".exe" or target_exe.suffix.lower() != ".exe":
+        append_install_log(log_path, "ERROR invalid source or target executable")
+        return 2
+
+    deadline = time.time() + 25
+    while time.time() < deadline:
+        blockers = target_executable_processes(target_exe)
+        if not blockers:
+            break
+        time.sleep(0.5)
+
+    blockers = target_executable_processes(target_exe)
+    for process in blockers:
+        try:
+            append_install_log(log_path, f"stopping target process pid={process.pid}")
+            process.terminate()
+        except (psutil.Error, OSError) as exc:
+            append_install_log(log_path, f"terminate failed pid={process.pid}: {exc}")
+    if blockers:
+        _gone, alive = psutil.wait_procs(blockers, timeout=3)
+        for process in alive:
+            try:
+                process.kill()
+            except (psutil.Error, OSError) as exc:
+                append_install_log(log_path, f"kill failed pid={process.pid}: {exc}")
+
+    backup = target_exe.with_suffix(target_exe.suffix + ".bak")
+    replacement = target_exe.with_suffix(target_exe.suffix + ".new")
+    for attempt in range(1, 41):
+        try:
+            if target_exe.exists() and attempt == 1:
+                shutil.copy2(target_exe, backup)
+                append_install_log(log_path, f"backup created: {backup}")
+            shutil.copy2(source_exe, replacement)
+            with replacement.open("rb") as file:
+                if file.read(2) != b"MZ":
+                    raise RuntimeError("replacement is not a Windows executable")
+            os.replace(replacement, target_exe)
+            append_install_log(log_path, f"update installed on attempt {attempt}")
+            return 0
+        except Exception as exc:
+            append_install_log(log_path, f"copy failed attempt {attempt}: {exc}")
+            replacement.unlink(missing_ok=True)
+            time.sleep(0.5)
+    append_install_log(log_path, "ERROR update copy failed after retries")
+    return 1
 
 
 def launch_update_installer_and_exit(downloaded_exe: Path, app_name: str) -> None:
     target_exe = current_executable()
     if target_exe is None:
         raise RuntimeError("当前是源码运行模式，只有打包后的 exe 支持一键安装更新。")
-    script = downloaded_exe.parent / "install_update.ps1"
     log_path = downloaded_exe.parent / "install_update.log"
     log_path.write_text(
         f"{time.strftime('%Y-%m-%d %H:%M:%S')} launcher prepared source={downloaded_exe} target={target_exe}\n",
         encoding="utf-8",
     )
-    script.write_text(
-        '''
-param(
-  [int]$TargetPid,
-  [string]$SourceExe,
-  [string]$TargetExe,
-  [string]$LogPath
-)
-
-$ErrorActionPreference = "Continue"
-
-function Write-InstallLog {
-  param([string]$Message)
-  $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff') $Message"
-  Add-Content -LiteralPath $LogPath -Encoding UTF8 -Value $line
-}
-
-function Get-TargetProcesses {
-  param([string]$TargetPath)
-  $targetFullPath = [System.IO.Path]::GetFullPath($TargetPath)
-  @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
-    try {
-      $_.Id -ne $PID -and $_.Path -and ([System.IO.Path]::GetFullPath($_.Path) -ieq $targetFullPath)
-    } catch {
-      $false
-    }
-  })
-}
-
-Write-InstallLog "installer start pid=$TargetPid source=$SourceExe target=$TargetExe"
-Start-Sleep -Milliseconds 800
-
-$deadline = (Get-Date).AddSeconds(20)
-do {
-  $blocking = Get-TargetProcesses -TargetPath $TargetExe
-  if ($blocking.Count -eq 0) {
-    break
-  }
-  Write-InstallLog ("waiting target processes: " + (($blocking | ForEach-Object { $_.Id }) -join ","))
-  Start-Sleep -Milliseconds 500
-} while ((Get-Date) -lt $deadline)
-
-$blocking = Get-TargetProcesses -TargetPath $TargetExe
-if ($blocking.Count -gt 0) {
-  Write-InstallLog ("force stopping target processes: " + (($blocking | ForEach-Object { $_.Id }) -join ","))
-  foreach ($proc in $blocking) {
-    try {
-      Stop-Process -Id $proc.Id -Force -ErrorAction Stop
-    } catch {
-      Write-InstallLog "force stop failed pid=$($proc.Id): $($_.Exception.Message)"
-    }
-  }
-  Start-Sleep -Milliseconds 800
-}
-
-try {
-  if (Test-Path -LiteralPath $TargetExe) {
-    Copy-Item -LiteralPath $TargetExe -Destination "$TargetExe.bak" -Force -ErrorAction Stop
-    Write-InstallLog "backup success"
-  }
-} catch {
-  Write-InstallLog "backup failed: $($_.Exception.Message)"
-}
-
-$copied = $false
-for ($i = 1; $i -le 40; $i++) {
-  try {
-    Copy-Item -LiteralPath $SourceExe -Destination $TargetExe -Force -ErrorAction Stop
-    Write-InstallLog "copy success attempt $i"
-    $copied = $true
-    break
-  } catch {
-    Write-InstallLog "copy failed attempt ${i}: $($_.Exception.Message)"
-    Start-Sleep -Milliseconds 500
-  }
-}
-
-if (-not $copied) {
-  Write-InstallLog "ERROR copy failed after retries"
-  exit 1
-}
-
-try {
-  Write-InstallLog "update installed; user should restart app manually"
-  exit 0
-} catch {
-  Write-InstallLog "ERROR finalizing update failed: $($_.Exception.Message)"
-  exit 1
-}
-'''.strip(),
-        encoding="utf-8",
+    creation_flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+    subprocess.Popen(
+        [
+            str(downloaded_exe),
+            "--install-update",
+            "--target-pid",
+            str(os.getpid()),
+            "--target-exe",
+            str(target_exe),
+            "--log-path",
+            str(log_path),
+        ],
+        cwd=str(downloaded_exe.parent),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+        creationflags=creation_flags,
     )
-    if os.name == "nt":
-        # Start PowerShell directly. The former VBS -> shell.Run hop is blocked by
-        # Windows Script Host policies on some machines with error 800A0046.
-        creation_flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
-        subprocess.Popen(
-            [
-                powershell_executable(),
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-WindowStyle",
-                "Hidden",
-                "-File",
-                str(script),
-                str(os.getpid()),
-                str(downloaded_exe),
-                str(target_exe),
-                str(log_path),
-            ],
-            cwd=str(target_exe.parent),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            close_fds=True,
-            creationflags=creation_flags,
-        )
-    else:
-        subprocess.Popen([powershell_executable(), "-File", str(script)], cwd=str(target_exe.parent))
     time.sleep(1.0)
     os._exit(0)
