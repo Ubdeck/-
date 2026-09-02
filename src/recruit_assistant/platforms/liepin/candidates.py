@@ -8,6 +8,9 @@ from .constants import RUNTIME_DIR
 
 
 class CandidateMixin:
+    CANDIDATE_CHANGE_TIMEOUT = 35
+    CANDIDATE_NAVIGATION_RETRIES = 3
+
     def ensure_candidate_detail_open(self) -> None:
         has_detail = self.page.run_js(
             """
@@ -40,11 +43,57 @@ class CandidateMixin:
         with open(output_path, "w", encoding="utf-8") as file:
             json.dump(profiles, file, ensure_ascii=False, indent=2)
 
-    def go_to_next_candidate_for_batch(self) -> None:
-        if self.has_candidate_turn_next():
-            self.click_next_candidate()
-            return
-        self.open_next_unread_candidate_from_list()
+    def go_to_next_candidate_for_batch(self) -> bool:
+        """Advance to the next candidate without making one slow page failure fatal."""
+        self.check_stopped()
+        last_error = None
+        try:
+            has_turn_next = self.has_candidate_turn_next()
+        except Exception as exc:
+            has_turn_next = False
+            last_error = exc
+        if has_turn_next:
+            for attempt in range(1, self.CANDIDATE_NAVIGATION_RETRIES + 1):
+                self.check_stopped()
+                try:
+                    self.click_next_candidate(timeout=self.CANDIDATE_CHANGE_TIMEOUT)
+                    return True
+                except Exception as exc:
+                    last_error = exc
+                    self.check_stopped()
+                    if attempt < self.CANDIDATE_NAVIGATION_RETRIES:
+                        self.progress.emit(
+                            "candidate_navigation_retry",
+                            f"候选人切换未完成，第 {attempt} 次重试（{exc}）",
+                            {"attempt": attempt, "error": str(exc)},
+                        )
+                        time.sleep(0.8)
+
+        # The preview arrow can remain visible while the list has already
+        # updated. Re-selecting the first unread card is a safer recovery path
+        # than terminating the whole batch.
+        for attempt in range(1, self.CANDIDATE_NAVIGATION_RETRIES + 1):
+            self.check_stopped()
+            try:
+                self.open_next_unread_candidate_from_list()
+                return True
+            except Exception as exc:
+                last_error = exc
+                self.check_stopped()
+                if attempt < self.CANDIDATE_NAVIGATION_RETRIES:
+                    self.progress.emit(
+                        "candidate_navigation_retry",
+                        f"从候选人列表恢复失败，第 {attempt} 次重试（{exc}）",
+                        {"attempt": attempt, "error": str(exc)},
+                    )
+                    time.sleep(0.8)
+
+        self.progress.emit(
+            "candidate_navigation_failed",
+            f"候选人切换失败，已跳过当前切换：{last_error or '未知错误'}",
+            {"error": str(last_error or "未知错误")},
+        )
+        return False
 
     def fill_filter_input(self, placeholder: str, value: str) -> None:
         input_ele = self.wait_for_input(placeholder)
@@ -149,7 +198,7 @@ class CandidateMixin:
             time.sleep(0.4)
         raise RuntimeError(f"Could not open first candidate: {last_result}")
 
-    def click_next_candidate(self) -> None:
+    def click_next_candidate(self, timeout: int = CANDIDATE_CHANGE_TIMEOUT) -> None:
         before_signature = self.get_candidate_signature()
         result = self.page.run_js(
             """
@@ -203,7 +252,7 @@ class CandidateMixin:
         )
         if not result or not result.get("ok"):
             raise RuntimeError(f"Could not click next candidate: {result}")
-        self.wait_for_candidate_change(before_signature)
+        self.wait_for_candidate_change(before_signature, timeout=timeout)
 
     def has_candidate_turn_next(self) -> bool:
         return bool(
@@ -222,7 +271,7 @@ class CandidateMixin:
             )
         )
 
-    def open_next_unread_candidate_from_list(self) -> None:
+    def open_next_unread_candidate_from_list(self, timeout: int = CANDIDATE_CHANGE_TIMEOUT) -> None:
         result = self.page.run_js(
             """
             const visible = ele => {
@@ -256,7 +305,7 @@ class CandidateMixin:
         )
         if not result or not result.get("ok"):
             raise RuntimeError(f"Could not open next candidate from list: {result}")
-        self.wait_for_candidate_preview()
+        self.wait_for_candidate_preview(timeout=timeout)
 
     def get_candidate_signature(self) -> str:
         signature = self.page.run_js(
@@ -271,7 +320,7 @@ class CandidateMixin:
         )
         return str(signature or "")
 
-    def wait_for_candidate_change(self, before_signature: str, timeout: int = 15) -> None:
+    def wait_for_candidate_change(self, before_signature: str, timeout: int = CANDIDATE_CHANGE_TIMEOUT) -> None:
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:

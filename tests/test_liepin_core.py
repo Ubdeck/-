@@ -13,9 +13,11 @@ from recruit_assistant.app_backend import AppState, DEFAULT_AI_TEMPLATE_ID, brow
 from recruit_assistant.model_config import messages_for_endpoint, resolve_model_endpoint
 from recruit_assistant.platforms.liepin.ai_matcher import AiMatcherMixin
 from recruit_assistant.platforms.liepin.browser import same_site_url
+from recruit_assistant.platforms.liepin.candidates import CandidateMixin
 from recruit_assistant.platforms.liepin.constants import DEFAULT_MATCH_REQUIREMENTS, RUNTIME_DIR
 from recruit_assistant.platforms.liepin.filters import FilterMixin
 from recruit_assistant.platforms.liepin.models import BatchProgress, SearchFilters
+from recruit_assistant.platforms.liepin.workflow import WorkflowMixin
 from recruit_assistant.platforms.maimai.ai_matcher import MaimaiAiMatcherMixin
 from recruit_assistant.platforms.maimai.automation import MaimaiRecruitPage
 from recruit_assistant.platforms.maimai.constants import DEFAULT_MAIMAI_MATCH_REQUIREMENTS, MAIMAI_TALENTS_URL
@@ -221,6 +223,109 @@ class LiepinCoreTests(unittest.TestCase):
         progress = BatchProgress(stop_event=stop_event)
         with self.assertRaisesRegex(RuntimeError, "任务已停止"):
             progress.check_stopped()
+
+    def test_candidate_processing_failure_does_not_abort_batch(self) -> None:
+        class Page(WorkflowMixin):
+            def __init__(self) -> None:
+                self.progress = BatchProgress()
+                self.saved = 0
+
+            def check_stopped(self) -> None:
+                return None
+
+            def ensure_candidate_detail_open(self) -> None:
+                return None
+
+            def save_candidate_profile(self, metadata):
+                self.saved += 1
+                if self.saved == 1:
+                    raise RuntimeError("profile read failed")
+                return {"basic": {"name": "候选人2"}, "job_intention": {}}
+
+            def decide_candidate_match(self, profile, filters):
+                return {"match": False, "score": 10, "decision": "reject", "reason": "不匹配"}
+
+            def append_batch_candidate(self, profile):
+                return None
+
+            def save_batch_summary(self, results):
+                return None
+
+            def go_to_next_candidate_for_batch(self):
+                return True
+
+        page = Page()
+        result = page.process_candidate_batch(
+            SearchFilters(candidate_limit=2, auto_communicate=False, request_resume_after_communicate=False)
+        )
+        self.assertEqual(result["processed"], 2)
+        self.assertEqual(page.saved, 2)
+        self.assertIn("候选人处理失败", result["results"][0]["reason"])
+        self.assertEqual(result["results"][1]["name"], "候选人2")
+
+    def test_navigation_failure_records_remaining_candidates_without_reprocessing(self) -> None:
+        class Page(WorkflowMixin):
+            def __init__(self) -> None:
+                self.progress = BatchProgress()
+                self.saved = 0
+
+            def check_stopped(self) -> None:
+                return None
+
+            def ensure_candidate_detail_open(self) -> None:
+                return None
+
+            def save_candidate_profile(self, metadata):
+                self.saved += 1
+                return {"basic": {"name": f"候选人{self.saved}"}, "job_intention": {}}
+
+            def decide_candidate_match(self, profile, filters):
+                return {"match": False, "score": 0, "decision": "reject", "reason": "跳过"}
+
+            def append_batch_candidate(self, profile):
+                return None
+
+            def save_batch_summary(self, results):
+                return None
+
+            def go_to_next_candidate_for_batch(self):
+                return False
+
+        page = Page()
+        result = page.process_candidate_batch(
+            SearchFilters(candidate_limit=3, auto_communicate=False, request_resume_after_communicate=False)
+        )
+        self.assertEqual(result["processed"], 3)
+        self.assertEqual(page.saved, 1)
+        self.assertEqual(result["results"][1]["communicate_status"], "skipped")
+        self.assertEqual(result["results"][2]["reason"], "候选人页面未能加载，已跳过")
+
+    def test_candidate_navigation_retries_before_failing(self) -> None:
+        class Page(CandidateMixin):
+            CANDIDATE_NAVIGATION_RETRIES = 2
+
+            def __init__(self) -> None:
+                self.progress = BatchProgress()
+                self.attempts = 0
+
+            def check_stopped(self) -> None:
+                return None
+
+            def has_candidate_turn_next(self) -> bool:
+                return True
+
+            def click_next_candidate(self, timeout=0):
+                self.attempts += 1
+                if self.attempts == 1:
+                    raise RuntimeError("candidate still loading")
+
+            def open_next_unread_candidate_from_list(self, timeout=0):
+                raise AssertionError("list fallback should not be needed")
+
+        page = Page()
+        with patch("recruit_assistant.platforms.liepin.candidates.time.sleep"):
+            self.assertTrue(page.go_to_next_candidate_for_batch())
+        self.assertEqual(page.attempts, 2)
 
     def test_multi_value_normalization(self) -> None:
         values = FilterMixin.split_multi_values("本科，硕士、博士; 本科")
