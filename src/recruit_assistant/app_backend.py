@@ -725,6 +725,8 @@ class AppState:
         self.stop_requested = False
         self.task_stop_event = threading.Event()
         self.stop_event = threading.Event()
+        self.scheduled_queue: list[tuple[str, str]] = []
+        self.scheduled_worker_active = False
         self.update_status: dict = {"phase": "idle", "message": "", "percent": 0, "downloaded": 0, "total": 0}
         self.data = self.load()
 
@@ -1114,8 +1116,8 @@ class AppState:
                 self.task_stop_event.clear()
             self.run_lock.release()
 
-    def run_task(self, task_id: str, reason: str) -> None:
-        if not self.run_lock.acquire(blocking=False):
+    def run_task(self, task_id: str, reason: str, wait_for_lock: bool = False) -> None:
+        if not self.run_lock.acquire(blocking=wait_for_lock):
             message = f"已有任务运行中，跳过：{reason}"
             self.add_log(message)
             self.notify("任务未启动", message, "warning")
@@ -1193,6 +1195,7 @@ class AppState:
                 self.stop_requested = False
                 self.task_stop_event.clear()
             self.run_lock.release()
+            self._dispatch_scheduled_task()
 
     def scheduler_loop(self) -> None:
         while not self.stop_event.wait(10):
@@ -1212,9 +1215,39 @@ class AppState:
                     last_runs[current_time] = run_key
                     due.append(task["id"])
                 if due:
+                    queued_ids = {task_id for task_id, _reason in self.scheduled_queue}
+                    for task_id in due:
+                        if task_id not in queued_ids:
+                            self.scheduled_queue.append((task_id, f"定时 {current_time}"))
+                            queued_ids.add(task_id)
                     self.save()
-            for task_id in due:
-                self.run_task_async(task_id, f"定时 {current_time}")
+            self._dispatch_scheduled_task()
+
+    def _dispatch_scheduled_task(self) -> None:
+        """Run due tasks sequentially so a busy run cannot silently drop them."""
+        with self.lock:
+            if self.running or self.scheduled_worker_active:
+                return
+            while self.scheduled_queue:
+                task_id, reason = self.scheduled_queue.pop(0)
+                if self.find_task(task_id):
+                    self.scheduled_worker_active = True
+                    break
+            else:
+                return
+        threading.Thread(
+            target=self._run_scheduled_task,
+            args=(task_id, reason),
+            daemon=True,
+        ).start()
+
+    def _run_scheduled_task(self, task_id: str, reason: str) -> None:
+        try:
+            self.run_task(task_id, reason, wait_for_lock=True)
+        finally:
+            with self.lock:
+                self.scheduled_worker_active = False
+            self._dispatch_scheduled_task()
 
     def stop_current_task(self) -> bool:
         with self.lock:

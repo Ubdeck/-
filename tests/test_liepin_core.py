@@ -9,7 +9,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from recruit_assistant.environment import parse_env_file
-from recruit_assistant.app_backend import AppState, DEFAULT_AI_TEMPLATE_ID, browser_port_candidates, default_ai_templates, normalize_company_model, normalize_config, normalize_platform, platform_home_url, select_browser_port
+from recruit_assistant.app_backend import AppState, DEFAULT_AI_TEMPLATE_ID, browser_port_candidates, default_ai_templates, new_task, normalize_company_model, normalize_config, normalize_platform, platform_home_url, select_browser_port
 from recruit_assistant.model_config import messages_for_endpoint, resolve_model_endpoint
 from recruit_assistant.platforms.liepin.ai_matcher import AiMatcherMixin
 from recruit_assistant.platforms.liepin.browser import same_site_url
@@ -317,6 +317,39 @@ class LiepinCoreTests(unittest.TestCase):
         self.assertEqual(duplicate["name"], "销售筛选 - 副本")
         self.assertFalse(duplicate["enabled"])
         self.assertEqual(duplicate["config"]["ai_template_id"], "sales-screening")
+
+    def test_tasks_keep_independent_selected_chat_jobs(self) -> None:
+        state = AppState()
+        first_id = state.data["tasks"][0]["id"]
+        job_a = {"job_id": "job-a", "title": "销售经理 A", "label": "销售经理 A | 深圳"}
+        job_b = {"job_id": "job-b", "title": "销售经理 B", "label": "销售经理 B | 上海"}
+        with patch.object(state, "save"):
+            first = state.save_task({"id": first_id, "name": "配置 A", "config": {"selected_chat_job": job_a}})
+            second = state.save_task({"name": "配置 B", "config": {"selected_chat_job": job_b}})
+        self.assertEqual(first["config"]["selected_chat_job"]["job_id"], "job-a")
+        self.assertEqual(second["config"]["selected_chat_job"]["job_id"], "job-b")
+        self.assertEqual(state.find_task(first_id)["config"]["selected_chat_job"]["job_id"], "job-a")
+
+    def test_scheduled_tasks_are_dispatched_in_order(self) -> None:
+        state = AppState()
+        first_id = state.data["tasks"][0]["id"]
+        second = new_task("第二套配置")
+        state.data["tasks"].append(second)
+        calls = []
+        completed = threading.Event()
+
+        def fake_run(task_id: str, reason: str, wait_for_lock: bool = False) -> None:
+            calls.append((task_id, reason, wait_for_lock))
+            if len(calls) == 2:
+                completed.set()
+
+        with patch.object(state, "run_task", side_effect=fake_run):
+            state.scheduled_queue = [(first_id, "定时 09:00"), (second["id"], "定时 09:00")]
+            state._dispatch_scheduled_task()
+            self.assertTrue(completed.wait(2))
+
+        self.assertEqual([item[0] for item in calls], [first_id, second["id"]])
+        self.assertTrue(all(item[2] for item in calls))
 
     def test_task_failure_creates_interruption_notification(self) -> None:
         state = AppState()
