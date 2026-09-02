@@ -301,14 +301,13 @@ class LiepinCoreTests(unittest.TestCase):
         self.assertEqual(result["results"][1]["communicate_status"], "skipped")
         self.assertEqual(result["results"][2]["reason"], "候选人页面未能加载，已跳过")
 
-    def test_candidate_navigation_clicks_arrow_once_then_uses_list_recovery(self) -> None:
+    def test_candidate_navigation_retries_the_arrow_when_the_first_click_fails(self) -> None:
         class Page(CandidateMixin):
             CANDIDATE_NAVIGATION_RETRIES = 2
 
             def __init__(self) -> None:
                 self.progress = BatchProgress()
                 self.arrow_attempts = 0
-                self.list_attempts = 0
 
             def check_stopped(self) -> None:
                 return None
@@ -321,17 +320,13 @@ class LiepinCoreTests(unittest.TestCase):
 
             def click_next_candidate(self, timeout=0):
                 self.arrow_attempts += 1
-                raise RuntimeError("candidate still loading")
-
-            def open_next_unread_candidate_from_list(self, timeout=0):
-                self.list_attempts += 1
-                raise RuntimeError("candidate list still loading")
+                if self.arrow_attempts == 1:
+                    raise RuntimeError("next arrow did not receive the first click")
 
         page = Page()
         with patch("recruit_assistant.platforms.liepin.candidates.time.sleep"):
-            self.assertFalse(page.go_to_next_candidate_for_batch())
-        self.assertEqual(page.arrow_attempts, 1)
-        self.assertEqual(page.list_attempts, 2)
+            self.assertTrue(page.go_to_next_candidate_for_batch())
+        self.assertEqual(page.arrow_attempts, 2)
 
     def test_candidate_navigation_accepts_a_delayed_signature_after_arrow_failure(self) -> None:
         class Page(CandidateMixin):

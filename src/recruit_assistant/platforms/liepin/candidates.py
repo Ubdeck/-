@@ -7,6 +7,12 @@ from pathlib import Path
 from .constants import RUNTIME_DIR
 
 
+class CandidateNavigationError(RuntimeError):
+    def __init__(self, message: str, *, clicked: bool) -> None:
+        super().__init__(message)
+        self.clicked = clicked
+
+
 class CandidateMixin:
     CANDIDATE_CHANGE_TIMEOUT = 35
     CANDIDATE_NAVIGATION_RETRIES = 3
@@ -58,50 +64,28 @@ class CandidateMixin:
             has_turn_next = False
             last_error = exc
         if has_turn_next:
-            # A click may have reached Liepin even when the DOM signature
-            # updates too late. Never click the arrow repeatedly: doing so can
-            # skip a candidate after a slow page response.
-            self.check_stopped()
-            try:
-                self.click_next_candidate(timeout=self.CANDIDATE_CHANGE_TIMEOUT)
-                return True
-            except Exception as exc:
-                last_error = exc
+            # Keep the arrow as the primary navigation path. A failed DOM
+            # click is retried, but a changed signature always ends the retry
+            # loop so a successful click cannot be issued twice.
+            for attempt in range(1, self.CANDIDATE_NAVIGATION_RETRIES + 1):
                 self.check_stopped()
-                # The click can succeed while the detail DOM lags behind the
-                # click handler. A changed signature proves the candidate has
-                # already advanced, so never click another navigation control.
+                try:
+                    self.click_next_candidate(timeout=self.CANDIDATE_CHANGE_TIMEOUT)
+                    return True
+                except Exception as exc:
+                    last_error = exc
+                self.check_stopped()
                 try:
                     current_signature = self.get_candidate_signature()
                 except Exception:
                     current_signature = ""
                 if before_signature and current_signature and current_signature != before_signature:
                     return True
-                self.progress.emit(
-                    "candidate_navigation_retry",
-                    f"候选人切换未完成，改从候选人列表恢复（{exc}）",
-                    {"attempt": 1, "error": str(exc), "arrow_clicks": 1},
-                )
-                time.sleep(0.8)
-
-        # The preview arrow can remain visible while the list has already
-        # updated. Re-selecting the first unread card is a safer recovery path
-        # than terminating the whole batch.
-        for attempt in range(1, self.CANDIDATE_NAVIGATION_RETRIES + 1):
-            self.check_stopped()
-            try:
-                self.open_next_unread_candidate_from_list()
-                if before_signature:
-                    self.wait_for_candidate_change(before_signature, timeout=self.CANDIDATE_CHANGE_TIMEOUT)
-                return True
-            except Exception as exc:
-                last_error = exc
-                self.check_stopped()
                 if attempt < self.CANDIDATE_NAVIGATION_RETRIES:
                     self.progress.emit(
                         "candidate_navigation_retry",
-                        f"从候选人列表恢复失败，第 {attempt} 次重试（{exc}）",
-                        {"attempt": attempt, "error": str(exc)},
+                        f"点击下一位未完成，第 {attempt} 次重试（{last_error}）",
+                        {"attempt": attempt, "error": str(last_error), "arrow_clicks": attempt + 1},
                     )
                     time.sleep(0.8)
 
@@ -254,9 +238,10 @@ class CandidateMixin:
               .filter(visible)
               .sort((a, b) => b.getBoundingClientRect().left - a.getBoundingClientRect().left);
             const button = candidates[0];
-            if (!button) return {ok: false, reason: 'next candidate button not found'};
+            if (!button) return {ok: false, reason: 'next candidate button not found', clicked: false};
             button.scrollIntoView({block: 'center', inline: 'nearest'});
-            for (const name of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+            if (typeof button.focus === 'function') button.focus({preventScroll: true});
+            for (const name of ['pointerdown', 'mousedown', 'pointerup', 'mouseup']) {
               button.dispatchEvent(new MouseEvent(name, {
                 bubbles: true,
                 cancelable: true,
@@ -264,12 +249,22 @@ class CandidateMixin:
                 view: window,
               }));
             }
-            return {ok: true};
+            // Use the element's native click for the single click event. It
+            // is more reliable for React/Vue handlers than a manually forged
+            // click event and avoids emitting two click events per attempt.
+            button.click();
+            return {ok: true, clicked: true};
             """
         )
         if not result or not result.get("ok"):
-            raise RuntimeError(f"Could not click next candidate: {result}")
-        self.wait_for_candidate_change(before_signature, timeout=timeout)
+            raise CandidateNavigationError(
+                f"Could not click next candidate: {result}",
+                clicked=bool(result and result.get("clicked")),
+            )
+        try:
+            self.wait_for_candidate_change(before_signature, timeout=timeout)
+        except Exception as exc:
+            raise CandidateNavigationError(str(exc), clicked=True) from exc
 
     def has_candidate_turn_next(self) -> bool:
         return bool(
