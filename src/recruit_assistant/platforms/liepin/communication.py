@@ -671,10 +671,12 @@ class CommunicationMixin:
         action = "phone" if action == "phone" else "resume"
         deadline = time.time() + timeout
         last_result = None
+        confirmed = False
         while time.time() < deadline:
             last_result = self.page.run_js(
                 """
                 const action = arguments[0];
+                const confirmed = Boolean(arguments[1]);
                 const visible = ele => {
                   const rect = ele.getBoundingClientRect();
                   const style = getComputedStyle(ele);
@@ -685,9 +687,8 @@ class CommunicationMixin:
                 const compact = value => clean(value).replace(/\\s+/g, '');
                 const actionName = action === 'phone' ? '电话' : '简历';
                 const config = action === 'phone'
-                  ? {askText: '索要手机', availableRe: /手机号|手机|电话|查看手机|查看电话|电话已获取|手机已获取/, modalRe: /确定.{0,30}(索要|获取).{0,12}(手机|电话)/}
-                  : {askText: '索要简历', availableRe: /看简历|查看简历|简历已获取/, modalRe: /确定.{0,30}(索要|获取).{0,12}简历/};
-                if (action === 'resume') config.askText = '索要简历';
+                  ? {askText: '索要手机', modalRe: /确定.{0,30}(索要|获取).{0,12}(手机|电话)/}
+                  : {askText: '索要简历', modalRe: /确定.{0,30}(索要|获取).{0,12}简历/};
                 const clickEle = ele => {
                   ele.scrollIntoView({block: 'center', inline: 'nearest'});
                   for (const name of ['mouseover', 'pointerover', 'pointerenter', 'mouseenter', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
@@ -711,6 +712,9 @@ class CommunicationMixin:
                   })
                   .sort((a, b) => textOf(a).length - textOf(b).length)[0];
                 if (confirmScope) {
+                  if (confirmed) {
+                    return {ok: false, waiting: true, reason: `${actionName}确认弹窗仍在关闭中`};
+                  }
                   const isConfirmButton = ele => {
                     const text = compact(textOf(ele));
                     if (!text || text.length > 12) return false;
@@ -753,61 +757,77 @@ class CommunicationMixin:
                   .filter(visible)
                   .sort((a, b) => b.getBoundingClientRect().width - a.getBoundingClientRect().width)[0];
                 if (!toolbar) return {ok: false, status: 'not_found', reason: '底部工具栏未找到'};
-                const all = Array.from(toolbar.querySelectorAll('*')).filter(visible);
-                const isAskText = ele => compact(textOf(ele)) === config.askText;
                 const actionButtonSelector = action === 'phone' ? '.im-ui-action-button.action-phone' : '.im-ui-action-button.action-resume';
                 const actionButtons = Array.from(toolbar.querySelectorAll(actionButtonSelector)).filter(visible);
-                const actionButton = actionButtons
-                  .find(ele => textOf(ele).includes(config.askText))
-                  || actionButtons.find(ele => compact(textOf(ele)) === config.askText);
-                const pendingButton = actionButtons.find(ele => /索要中|已索要|等待/.test(textOf(ele)));
-                if (pendingButton) {
-                  return {ok: true, status: 'already_requested', message: `${actionName}已索要，当前为：${textOf(pendingButton).slice(0, 24)}`};
+                const actionButton = actionButtons[0];
+                if (!actionButton) {
+                  return {ok: true, status: 'unavailable', message: `${actionName}操作按钮未找到`};
                 }
-                const isAvailableText = ele => {
-                  const text = textOf(ele);
-                  const compactText = compact(text);
-                  if (action === 'phone' && /^(手机号|手机|电话|查看手机|查看电话|电话已获取|手机已获取)$/.test(compactText)) return true;
-                  if (action === 'resume' && /^(看简历|查看简历|简历已获取)$/.test(compactText)) return true;
-                  if (!config.availableRe.test(text)) return false;
-                  return !isAskText(ele);
-                };
-                const available = all
-                  .filter(isAvailableText)
-                  .filter(ele => textOf(ele).length <= 30)
-                  .sort((a, b) => textOf(a).length - textOf(b).length)[0];
-                if (available) return {ok: true, status: 'already_available', message: `${actionName}已可查看：${textOf(available).slice(0, 24)}`};
-                const exactAction = actionButton;
-                const ask = exactAction || all
-                  .filter(isAskText)
-                  .filter(ele => textOf(ele).length <= 30)
-                  .sort((a, b) => {
-                    return textOf(a).length - textOf(b).length;
-                  })[0];
-                if (!ask) return {ok: true, status: 'not_needed', message: `底部不是${config.askText}，跳过`};
-                let button = ask;
-                for (let node = ask, depth = 0; node && depth < 6; node = node.parentElement, depth += 1) {
-                  const style = getComputedStyle(node);
-                  const tag = node.tagName;
-                  if (tag === 'BUTTON' || tag === 'A' || node.getAttribute('role') === 'button' || style.cursor === 'pointer') {
-                    button = node;
-                    break;
-                  }
+                const buttonText = compact(textOf(actionButton));
+                const className = String(actionButton.className || '');
+                const disabled = className.includes('disabled') || actionButton.getAttribute('aria-disabled') === 'true';
+                const pending = /^(索要中|已索要|等待对方|等待回应|申请中)$/.test(buttonText);
+                const available = action === 'phone'
+                  ? !/索要|获取|申请|交换/.test(buttonText)
+                    && /^(手机号|手机|电话|查看手机|查看电话|查看手机号|查看电话号码|电话已获取|手机已获取)$/.test(buttonText)
+                  : !/索要|获取|申请/.test(buttonText)
+                    && /^(看简历|查看简历|下载简历|简历已获取)$/.test(buttonText);
+                if (pending) {
+                  return {
+                    ok: true,
+                    status: confirmed ? 'requested' : 'already_requested',
+                    message: confirmed
+                      ? `已确认索要${actionName}，按钮状态：${buttonText}`
+                      : `${actionName}此前已索要，按钮状态：${buttonText}`,
+                  };
                 }
-                clickEle(button);
-                return {ok: false, clicked: true, reason: `已点击${actionName}按钮，等待确认或状态变化`, clicked_text: textOf(button), clicked_class: String(button.className || '')};
+                if (available) {
+                  return {
+                    ok: true,
+                    status: confirmed ? 'requested' : 'already_available',
+                    message: confirmed
+                      ? `已确认索要${actionName}，当前可查看：${buttonText}`
+                      : `${actionName}此前已可查看：${buttonText}`,
+                  };
+                }
+                if (confirmed) {
+                  return {
+                    ok: false,
+                    waiting: true,
+                    reason: `已确认索要${actionName}，等待按钮状态变化`,
+                    button_text: buttonText,
+                    disabled,
+                  };
+                }
+                if (buttonText !== config.askText || disabled) {
+                  return {
+                    ok: true,
+                    status: 'unavailable',
+                    message: `${actionName}按钮状态无法执行：${buttonText || '无文字'}`,
+                  };
+                }
+                clickEle(actionButton);
+                return {ok: false, clicked: true, reason: `已点击${actionName}按钮，等待确认弹窗`, clicked_text: buttonText, clicked_class: className};
                 """,
                 action,
+                confirmed,
             )
             if last_result and last_result.get("ok"):
                 return last_result
             if last_result and last_result.get("confirming"):
-                time.sleep(1.0)
-                return {"status": "requested", "message": str(last_result.get("reason") or "已确认")}
+                confirmed = True
+                time.sleep(0.9)
+                continue
             if last_result and last_result.get("clicked"):
                 time.sleep(0.9)
                 continue
             time.sleep(0.35)
+        if confirmed:
+            action_name = "电话" if action == "phone" else "简历"
+            return {
+                "status": "failed",
+                "message": f"已点击确认，但{action_name}按钮状态未在超时前变化：{last_result or '未知状态'}",
+            }
         return {"status": "failed", "message": str(last_result or "按钮未找到")}
 
     @staticmethod
@@ -816,6 +836,7 @@ class CommunicationMixin:
             "requested": "已索要",
             "already_requested": "已索要",
             "already_available": "已可查看",
+            "unavailable": "不可操作",
             "not_found": "未找到会话",
             "failed": "失败",
             "unknown": "未知",

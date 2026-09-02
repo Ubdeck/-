@@ -399,6 +399,41 @@ class LiepinCoreTests(unittest.TestCase):
         self.assertIn("config.modalRe.test(textOf(ele))", source)
         self.assertNotIn("textOf(ele).includes('确定向对方索要')", source)
 
+    def test_liepin_contact_state_only_reads_the_action_specific_button(self) -> None:
+        source = inspect.getsource(CommunicationMixin.request_chat_action_in_current_chat)
+        self.assertIn("toolbar.querySelectorAll(actionButtonSelector)", source)
+        self.assertIn("const buttonText = compact(textOf(actionButton));", source)
+        self.assertNotIn("toolbar.querySelectorAll('*')", source)
+        self.assertIn("!/索要|获取|申请|交换/.test(buttonText)", source)
+
+    def test_liepin_contact_confirmation_waits_for_a_verified_button_state(self) -> None:
+        source = inspect.getsource(CommunicationMixin.request_chat_action_in_current_chat)
+        self.assertIn("const confirmed = Boolean(arguments[1]);", source)
+        self.assertIn("status: confirmed ? 'requested' : 'already_requested'", source)
+        self.assertIn("等待按钮状态变化", source)
+        self.assertNotIn('return {"status": "requested", "message": str(last_result.get("reason")', source)
+
+    def test_liepin_contact_confirmation_does_not_report_success_before_state_changes(self) -> None:
+        class BrowserPage:
+            def __init__(self) -> None:
+                self.calls = []
+                self.results = [
+                    {"ok": False, "clicked": True, "reason": "clicked action"},
+                    {"ok": False, "clicked": True, "confirming": True, "reason": "clicked confirm"},
+                    {"ok": True, "status": "requested", "message": "button is pending"},
+                ]
+
+            def run_js(self, _script: str, action: str, confirmed: bool):
+                self.calls.append((action, confirmed))
+                return self.results.pop(0)
+
+        page = object.__new__(CommunicationMixin)
+        page.page = BrowserPage()
+        with patch("recruit_assistant.platforms.liepin.communication.time.sleep"):
+            result = page.request_chat_action_in_current_chat("phone", timeout=1)
+        self.assertEqual(result["status"], "requested")
+        self.assertEqual(page.page.calls, [("phone", False), ("phone", False), ("phone", True)])
+
     def test_multi_value_normalization(self) -> None:
         values = FilterMixin.split_multi_values("本科，硕士、博士; 本科")
         self.assertEqual(values, ["本科", "硕士", "博士", "本科"])
