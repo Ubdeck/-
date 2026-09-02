@@ -121,40 +121,63 @@ class WorkflowMixin:
         for index in range(limit):
             self.check_stopped()
             self.progress.emit("candidate_start", f"开始处理第 {index + 1}/{limit} 个候选人")
-            profile = self.save_candidate_profile(
-                {
-                    "selected_chat_job": filters.selected_chat_job,
-                    "batch_index": index + 1,
-                    "batch_limit": limit,
+            profile = {
+                "basic": {},
+                "job_intention": {},
+                "selected_chat_job": filters.selected_chat_job,
+                "batch_index": index + 1,
+                "batch_limit": limit,
+            }
+            processing_status = "completed"
+            decision = {
+                "match": False,
+                "score": 0,
+                "decision": "uncertain",
+                "reason": "候选人尚未处理",
+                "next_action": "skip",
+            }
+            try:
+                profile = self.save_candidate_profile(
+                    {
+                        "selected_chat_job": filters.selected_chat_job,
+                        "batch_index": index + 1,
+                        "batch_limit": limit,
+                    }
+                )
+                self.progress.emit(
+                    "candidate_profile",
+                    (
+                        f"第 {index + 1}/{limit} 个：{profile.get('basic', {}).get('name', '')}，"
+                        f"{profile.get('job_intention', {}).get('position', '')}，"
+                        f"{profile.get('basic', {}).get('location', '')}"
+                    ),
+                    {
+                        "index": index + 1,
+                        "name": profile.get("basic", {}).get("name", ""),
+                        "job_position": profile.get("job_intention", {}).get("position", ""),
+                        "location": profile.get("basic", {}).get("location", ""),
+                    },
+                )
+                decision = self.decide_candidate_match(profile, filters)
+                time.sleep(0.6)
+                profile["ai_match"] = decision
+            except Exception as exc:
+                self.check_stopped()
+                decision = {
+                    "match": False,
+                    "score": 0,
+                    "decision": "uncertain",
+                    "reason": f"候选人处理失败，已跳过：{exc}",
+                    "next_action": "skip",
+                    "candidate_error": str(exc),
                 }
-            )
-            self.progress.emit(
-                "candidate_profile",
-                (
-                    f"第 {index + 1}/{limit} 个：{profile.get('basic', {}).get('name', '')}，"
-                    f"{profile.get('job_intention', {}).get('position', '')}，"
-                    f"{profile.get('basic', {}).get('location', '')}"
-                ),
-                {
-                    "index": index + 1,
-                    "name": profile.get("basic", {}).get("name", ""),
-                    "job_position": profile.get("job_intention", {}).get("position", ""),
-                    "location": profile.get("basic", {}).get("location", ""),
-                },
-            )
-            decision = self.decide_candidate_match(profile, filters)
-            time.sleep(0.6)
-            profile["ai_match"] = decision
-            self.append_batch_candidate(profile)
-            self.progress.emit(
-                "ai_decision",
-                (
-                    f"第 {index + 1}/{limit} 个AI结果："
-                    f"{'匹配' if decision.get('match') else '不匹配'}，"
-                    f"{decision.get('score', 0)}分，{decision.get('reason', '')}"
-                ),
-                decision,
-            )
+                profile["candidate_error"] = str(exc)
+                processing_status = "failed"
+                self.progress.emit(
+                    "candidate_failed",
+                    f"第 {index + 1}/{limit} 个候选人处理失败，已跳过：{exc}",
+                    {"index": index + 1, "error": str(exc)},
+                )
 
             if decision.get("match") and filters.auto_communicate:
                 self.progress.emit("communicate_start", f"第 {index + 1}/{limit} 个匹配，开始点击立即沟通")
@@ -170,6 +193,7 @@ class WorkflowMixin:
                     else:
                         self.progress.emit("communicate_done", f"第 {index + 1}/{limit} 个已完成职位选择和确认")
                 except Exception as exc:
+                    self.check_stopped()
                     decision["communicate_status"] = "failed"
                     decision["communicate_error"] = str(exc)
                     self.progress.emit(
@@ -193,21 +217,31 @@ class WorkflowMixin:
                 "strengths": decision.get("strengths", []),
                 "risks": decision.get("risks", []),
                 "must_have_result": decision.get("must_have_result", []),
+                "processing_status": processing_status,
             }
             if decision.get("communicate_status") == "done" and should_request_contacts:
-                contact_results = self.request_contacts_from_continue_chat(
-                    index=index + 1,
-                    request_resume=filters.request_resume_after_communicate,
-                    request_phone=filters.request_phone_after_communicate,
-                )
-                if filters.request_resume_after_communicate:
-                    resume = contact_results.get("resume") or {}
-                    result_item["resume_request_status"] = resume.get("status", "unknown")
-                    result_item["resume_request_note"] = resume.get("message", "")
-                if filters.request_phone_after_communicate:
-                    phone = contact_results.get("phone") or {}
-                    result_item["phone_request_status"] = phone.get("status", "unknown")
-                    result_item["phone_request_note"] = phone.get("message", "")
+                try:
+                    contact_results = self.request_contacts_from_continue_chat(
+                        index=index + 1,
+                        request_resume=filters.request_resume_after_communicate,
+                        request_phone=filters.request_phone_after_communicate,
+                    )
+                    if filters.request_resume_after_communicate:
+                        resume = contact_results.get("resume") or {}
+                        result_item["resume_request_status"] = resume.get("status", "unknown")
+                        result_item["resume_request_note"] = resume.get("message", "")
+                    if filters.request_phone_after_communicate:
+                        phone = contact_results.get("phone") or {}
+                        result_item["phone_request_status"] = phone.get("status", "unknown")
+                        result_item["phone_request_note"] = phone.get("message", "")
+                except Exception as exc:
+                    self.check_stopped()
+                    result_item["contact_error"] = str(exc)
+                    self.progress.emit(
+                        "contact_failed",
+                        f"第 {index + 1}/{limit} 个联系方式处理失败，继续下一个：{exc}",
+                        {"index": index + 1, "error": str(exc)},
+                    )
             elif decision.get("communicate_status") == "already_communicated":
                 self.progress.emit(
                     "resume_request_skip",
@@ -220,11 +254,46 @@ class WorkflowMixin:
 
             if index < limit - 1:
                 self.progress.emit("next_candidate", f"切换到第 {index + 2}/{limit} 个候选人")
-                self.go_to_next_candidate_for_batch()
+                advanced = self.go_to_next_candidate_for_batch()
+                if not advanced:
+                    # Do not process the same visible profile twice when all
+                    # bounded recovery attempts fail. The batch still closes
+                    # normally and the remaining people are recorded as
+                    # skipped instead of being reported as a hard crash.
+                    self.progress.emit(
+                        "candidate_navigation_degraded",
+                        f"第 {index + 2}/{limit} 个候选人无法加载，剩余候选人已跳过并完成任务",
+                        {"index": index + 2},
+                    )
+                    for skipped_index in range(index + 1, limit):
+                        skipped = {
+                            "index": skipped_index + 1,
+                            "name": "",
+                            "location": "",
+                            "job_position": "",
+                            "job_cities": "",
+                            "match": False,
+                            "score": 0,
+                            "decision": "uncertain",
+                            "reason": "候选人页面未能加载，已跳过",
+                            "communicate_note": "",
+                            "communicate_status": "skipped",
+                            "candidate_error": "Next candidate did not load.",
+                            "processing_status": "skipped",
+                        }
+                        results.append(skipped)
+                        self.progress.emit(
+                            "candidate_result",
+                            f"第 {skipped_index + 1}/{limit} 个已跳过并写入列表",
+                            skipped,
+                        )
+                    self.save_batch_summary(results)
+                    break
 
         summary = {
             "processed": len(results),
             "matched": sum(1 for item in results if item.get("match")),
+            "skipped": sum(1 for item in results if item.get("processing_status") == "skipped"),
             "results": results,
         }
         self.save_batch_summary(results)
@@ -234,6 +303,7 @@ class WorkflowMixin:
         summary = {
             "processed": len(results),
             "matched": sum(1 for item in results if item.get("match")),
+            "skipped": sum(1 for item in results if item.get("processing_status") == "skipped"),
             "results": results,
         }
         summary_path = RUNTIME_DIR / "candidate_batch_summary.json"

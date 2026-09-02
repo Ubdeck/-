@@ -1169,6 +1169,9 @@ class AppState:
                     summary = f"脉脉批量完成：处理 {result.get('processed', 0)} 人，匹配 {result.get('matched', 0)} 人。"
                 else:
                     summary = f"批量完成：处理 {result.get('processed', 0)} 人，匹配 {result.get('matched', 0)} 人。"
+                skipped = int(result.get("skipped", 0) or 0)
+                if skipped:
+                    summary = summary[:-1] + f"，页面未加载跳过 {skipped} 人。"
             elif result:
                 summary = f"完成：AI结果 {result.get('decision', '')}，{result.get('score', 0)} 分。"
             else:
