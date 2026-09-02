@@ -152,12 +152,15 @@ function applyAiProviderUI(resetModel = false) {
 function renderJobSelect(cfg = null) {
   const jobSelect = document.getElementById("selected_chat_job");
   if (!jobSelect) return;
-  const currentLabel = jobSelect.value || "";
-  const configLabel = cfg && cfg.selected_chat_job ? formatJobLabel(cfg.selected_chat_job) : "";
-  const selectedJobLabel = currentLabel || configLabel;
-  jobSelect.innerHTML = `<option value="">自动选择第一个职位</option>` + (state.jobs || []).map(job => {
+  const savedJob = cfg?.selected_chat_job || null;
+  const selectedJobKey = cfg === null ? jobSelect.value : jobKey(savedJob);
+  const jobs = [...(state.jobs || [])];
+  if (savedJob && !jobs.some(job => jobKey(job) === selectedJobKey)) jobs.unshift(savedJob);
+  jobSelect.innerHTML = `<option value="">自动选择第一个职位</option>` + jobs.map(job => {
+    const key = jobKey(job);
     const label = formatJobLabel(job);
-    return `<option value="${escapeHtml(label)}"${label === selectedJobLabel ? " selected" : ""}>${escapeHtml(label)}</option>`;
+    const suffix = savedJob === job && !(state.jobs || []).some(item => jobKey(item) === key) ? "（已保存）" : "";
+    return `<option value="${escapeHtml(key)}"${key === selectedJobKey ? " selected" : ""}>${escapeHtml(label + suffix)}</option>`;
   }).join("");
 }
 function fillForm(task) {
@@ -212,9 +215,11 @@ function readForm() {
   cfg.expected_industries = normalizeIndustries(expectedIndustries);
   cfg.current_functions = normalizeIndustries(currentFunctions);
   cfg.expected_functions = normalizeIndustries(expectedFunctions);
-  const jobLabel = document.getElementById("selected_chat_job").value;
+  const selectedJobKey = document.getElementById("selected_chat_job").value;
+  const savedJob = activeTask()?.config?.selected_chat_job || null;
   cfg.selected_chat_job = cfg.platform === "liepin"
-    ? ((state.jobs || []).find(job => formatJobLabel(job) === jobLabel) || null)
+    ? ((state.jobs || []).find(job => jobKey(job) === selectedJobKey)
+      || (jobKey(savedJob) === selectedJobKey ? {...savedJob} : null))
     : null;
   return {
     id: activeTaskId || undefined,
@@ -476,6 +481,12 @@ function removeScheduleTime(time) {
 }
 function formatJobLabel(job) {
   return job.label || [job.title, job.city, job.salary].filter(Boolean).join(" | ");
+}
+function jobKey(job) {
+  if (!job) return "";
+  if (job.job_id) return `id:${job.job_id}`;
+  if (job.href) return `href:${job.href}`;
+  return `label:${formatJobLabel(job)}`;
 }
 async function selectTask(id) {
   activeTaskId = id;

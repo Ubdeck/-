@@ -318,6 +318,18 @@ class LiepinCoreTests(unittest.TestCase):
         self.assertFalse(duplicate["enabled"])
         self.assertEqual(duplicate["config"]["ai_template_id"], "sales-screening")
 
+    def test_tasks_keep_independent_selected_chat_jobs(self) -> None:
+        state = AppState()
+        first_id = state.data["tasks"][0]["id"]
+        job_a = {"job_id": "job-a", "title": "销售经理 A", "label": "销售经理 A | 深圳"}
+        job_b = {"job_id": "job-b", "title": "销售经理 B", "label": "销售经理 B | 上海"}
+        with patch.object(state, "save"):
+            first = state.save_task({"id": first_id, "name": "配置 A", "config": {"selected_chat_job": job_a}})
+            second = state.save_task({"name": "配置 B", "config": {"selected_chat_job": job_b}})
+        self.assertEqual(first["config"]["selected_chat_job"]["job_id"], "job-a")
+        self.assertEqual(second["config"]["selected_chat_job"]["job_id"], "job-b")
+        self.assertEqual(state.find_task(first_id)["config"]["selected_chat_job"]["job_id"], "job-a")
+
     def test_task_failure_creates_interruption_notification(self) -> None:
         state = AppState()
         task = state.data["tasks"][0]
