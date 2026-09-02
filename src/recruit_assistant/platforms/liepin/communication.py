@@ -685,8 +685,8 @@ class CommunicationMixin:
                 const compact = value => clean(value).replace(/\\s+/g, '');
                 const actionName = action === 'phone' ? '电话' : '简历';
                 const config = action === 'phone'
-                  ? {askText: '索要手机', availableRe: /手机号|手机|电话|查看手机|查看电话|电话已获取|手机已获取/, modalRe: /确定向对方索要(手机|电话)吗|确定.*(索要|获取).*(手机|电话)/}
-                  : {askRe: /索要简历/, availableRe: /看简历|查看简历|简历已获取/, modalRe: /确定向对方索要简历吗|确定.*索要.*简历/};
+                  ? {askText: '索要手机', availableRe: /手机号|手机|电话|查看手机|查看电话|电话已获取|手机已获取/, modalRe: /确定.{0,30}(索要|获取).{0,12}(手机|电话)/}
+                  : {askText: '索要简历', availableRe: /看简历|查看简历|简历已获取/, modalRe: /确定.{0,30}(索要|获取).{0,12}简历/};
                 if (action === 'resume') config.askText = '索要简历';
                 const clickEle = ele => {
                   ele.scrollIntoView({block: 'center', inline: 'nearest'});
@@ -694,12 +694,22 @@ class CommunicationMixin:
                     ele.dispatchEvent(new MouseEvent(name, {bubbles: true, cancelable: true, composed: true, view: window}));
                   }
                 };
+                const hasConfirmButton = ele => Array.from(ele.querySelectorAll('button, [role=button], a'))
+                  .some(button => visible(button) && /^(确定|确认|确定索要|确认索要|确定获取|确认获取)$/.test(compact(textOf(button))));
                 const dialog = Array.from(document.querySelectorAll('.ant-im-modal, .ant-lpt-modal, [role=dialog], [class*=modal]'))
                   .filter(visible)
-                  .find(ele => config.modalRe.test(textOf(ele)) || (textOf(ele).includes('确定向对方索要') && textOf(ele).includes(actionName)));
+                  .filter(ele => config.modalRe.test(textOf(ele)) && hasConfirmButton(ele))
+                  .sort((a, b) => textOf(a).length - textOf(b).length)[0];
                 const confirmScope = dialog || Array.from(document.querySelectorAll('.ant-im-popover, .ant-popover, [class*=popover], [class*=Popconfirm]'))
                   .filter(visible)
-                  .find(ele => /确定|确认/.test(textOf(ele)) && (textOf(ele).includes(actionName) || textOf(ele).includes('索要') || textOf(ele).length <= 120));
+                  .filter(ele => {
+                    const text = textOf(ele);
+                    return /确定|确认/.test(text)
+                      && text.includes(actionName)
+                      && config.modalRe.test(text)
+                      && hasConfirmButton(ele);
+                  })
+                  .sort((a, b) => textOf(a).length - textOf(b).length)[0];
                 if (confirmScope) {
                   const isConfirmButton = ele => {
                     const text = compact(textOf(ele));
@@ -757,10 +767,8 @@ class CommunicationMixin:
                 const isAvailableText = ele => {
                   const text = textOf(ele);
                   const compactText = compact(text);
-                  if (action === 'phone' && /^(手机号|手机|电话|查看手机|查看电话)$/.test(compactText)) return true;
-                  if (action === 'resume' && /^(看简历|查看简历)$/.test(compactText)) return true;
-                  if (action === 'phone') return false;
-                  if (action === 'resume') return false;
+                  if (action === 'phone' && /^(手机号|手机|电话|查看手机|查看电话|电话已获取|手机已获取)$/.test(compactText)) return true;
+                  if (action === 'resume' && /^(看简历|查看简历|简历已获取)$/.test(compactText)) return true;
                   if (!config.availableRe.test(text)) return false;
                   return !isAskText(ele);
                 };

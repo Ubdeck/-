@@ -48,26 +48,41 @@ class CandidateMixin:
         self.check_stopped()
         last_error = None
         try:
+            before_signature = self.get_candidate_signature()
+        except Exception as exc:
+            before_signature = ""
+            last_error = exc
+        try:
             has_turn_next = self.has_candidate_turn_next()
         except Exception as exc:
             has_turn_next = False
             last_error = exc
         if has_turn_next:
-            for attempt in range(1, self.CANDIDATE_NAVIGATION_RETRIES + 1):
+            # A click may have reached Liepin even when the DOM signature
+            # updates too late. Never click the arrow repeatedly: doing so can
+            # skip a candidate after a slow page response.
+            self.check_stopped()
+            try:
+                self.click_next_candidate(timeout=self.CANDIDATE_CHANGE_TIMEOUT)
+                return True
+            except Exception as exc:
+                last_error = exc
                 self.check_stopped()
+                # The click can succeed while the detail DOM lags behind the
+                # click handler. A changed signature proves the candidate has
+                # already advanced, so never click another navigation control.
                 try:
-                    self.click_next_candidate(timeout=self.CANDIDATE_CHANGE_TIMEOUT)
+                    current_signature = self.get_candidate_signature()
+                except Exception:
+                    current_signature = ""
+                if before_signature and current_signature and current_signature != before_signature:
                     return True
-                except Exception as exc:
-                    last_error = exc
-                    self.check_stopped()
-                    if attempt < self.CANDIDATE_NAVIGATION_RETRIES:
-                        self.progress.emit(
-                            "candidate_navigation_retry",
-                            f"候选人切换未完成，第 {attempt} 次重试（{exc}）",
-                            {"attempt": attempt, "error": str(exc)},
-                        )
-                        time.sleep(0.8)
+                self.progress.emit(
+                    "candidate_navigation_retry",
+                    f"候选人切换未完成，改从候选人列表恢复（{exc}）",
+                    {"attempt": 1, "error": str(exc), "arrow_clicks": 1},
+                )
+                time.sleep(0.8)
 
         # The preview arrow can remain visible while the list has already
         # updated. Re-selecting the first unread card is a safer recovery path
@@ -76,6 +91,8 @@ class CandidateMixin:
             self.check_stopped()
             try:
                 self.open_next_unread_candidate_from_list()
+                if before_signature:
+                    self.wait_for_candidate_change(before_signature, timeout=self.CANDIDATE_CHANGE_TIMEOUT)
                 return True
             except Exception as exc:
                 last_error = exc

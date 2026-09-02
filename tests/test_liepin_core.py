@@ -14,6 +14,7 @@ from recruit_assistant.model_config import messages_for_endpoint, resolve_model_
 from recruit_assistant.platforms.liepin.ai_matcher import AiMatcherMixin
 from recruit_assistant.platforms.liepin.browser import same_site_url
 from recruit_assistant.platforms.liepin.candidates import CandidateMixin
+from recruit_assistant.platforms.liepin.communication import CommunicationMixin
 from recruit_assistant.platforms.liepin.constants import DEFAULT_MATCH_REQUIREMENTS, RUNTIME_DIR
 from recruit_assistant.platforms.liepin.filters import FilterMixin
 from recruit_assistant.platforms.liepin.models import BatchProgress, SearchFilters
@@ -300,32 +301,108 @@ class LiepinCoreTests(unittest.TestCase):
         self.assertEqual(result["results"][1]["communicate_status"], "skipped")
         self.assertEqual(result["results"][2]["reason"], "候选人页面未能加载，已跳过")
 
-    def test_candidate_navigation_retries_before_failing(self) -> None:
+    def test_candidate_navigation_clicks_arrow_once_then_uses_list_recovery(self) -> None:
         class Page(CandidateMixin):
             CANDIDATE_NAVIGATION_RETRIES = 2
 
             def __init__(self) -> None:
                 self.progress = BatchProgress()
-                self.attempts = 0
+                self.arrow_attempts = 0
+                self.list_attempts = 0
 
             def check_stopped(self) -> None:
                 return None
+
+            def get_candidate_signature(self) -> str:
+                return "candidate-1"
 
             def has_candidate_turn_next(self) -> bool:
                 return True
 
             def click_next_candidate(self, timeout=0):
-                self.attempts += 1
-                if self.attempts == 1:
-                    raise RuntimeError("candidate still loading")
+                self.arrow_attempts += 1
+                raise RuntimeError("candidate still loading")
 
             def open_next_unread_candidate_from_list(self, timeout=0):
-                raise AssertionError("list fallback should not be needed")
+                self.list_attempts += 1
+                raise RuntimeError("candidate list still loading")
+
+        page = Page()
+        with patch("recruit_assistant.platforms.liepin.candidates.time.sleep"):
+            self.assertFalse(page.go_to_next_candidate_for_batch())
+        self.assertEqual(page.arrow_attempts, 1)
+        self.assertEqual(page.list_attempts, 2)
+
+    def test_candidate_navigation_accepts_a_delayed_signature_after_arrow_failure(self) -> None:
+        class Page(CandidateMixin):
+            def __init__(self) -> None:
+                self.progress = BatchProgress()
+                self.signatures = iter(("candidate-1", "candidate-2"))
+                self.arrow_attempts = 0
+
+            def check_stopped(self) -> None:
+                return None
+
+            def get_candidate_signature(self) -> str:
+                return next(self.signatures, "candidate-2")
+
+            def has_candidate_turn_next(self) -> bool:
+                return True
+
+            def click_next_candidate(self, timeout=0):
+                self.arrow_attempts += 1
+                raise RuntimeError("DOM signature update was delayed")
+
+            def open_next_unread_candidate_from_list(self, timeout=0):
+                raise AssertionError("list recovery would risk skipping the candidate")
 
         page = Page()
         with patch("recruit_assistant.platforms.liepin.candidates.time.sleep"):
             self.assertTrue(page.go_to_next_candidate_for_batch())
-        self.assertEqual(page.attempts, 2)
+        self.assertEqual(page.arrow_attempts, 1)
+
+    def test_contact_action_failure_does_not_block_the_next_action(self) -> None:
+        class Page(CommunicationMixin):
+            def __init__(self) -> None:
+                self.progress = BatchProgress()
+                self.actions = []
+                self.dismissed = 0
+                self.closed = 0
+
+            def open_continue_chat_panel(self):
+                return {"ok": True}
+
+            def request_chat_action_in_current_chat(self, action: str):
+                self.actions.append(action)
+                if action == "phone":
+                    raise RuntimeError("phone confirmation was not found")
+                return {"status": "requested", "message": "resume requested"}
+
+            def dismiss_chat_confirm_overlay(self) -> None:
+                self.dismissed += 1
+
+            def close_continue_chat_panel(self):
+                self.closed += 1
+                return {"ok": True}
+
+        page = Page()
+        with patch("recruit_assistant.platforms.liepin.communication.time.sleep"):
+            result = page.request_contacts_from_continue_chat(
+                index=1,
+                request_resume=True,
+                request_phone=True,
+            )
+        self.assertEqual(page.actions, ["phone", "resume"])
+        self.assertEqual(page.dismissed, 1)
+        self.assertEqual(page.closed, 1)
+        self.assertEqual(result["phone"]["status"], "failed")
+        self.assertEqual(result["resume"]["status"], "requested")
+
+    def test_liepin_contact_modal_matching_requires_action_text_and_confirm_button(self) -> None:
+        source = inspect.getsource(CommunicationMixin.request_chat_action_in_current_chat)
+        self.assertIn("hasConfirmButton", source)
+        self.assertIn("config.modalRe.test(textOf(ele))", source)
+        self.assertNotIn("textOf(ele).includes('确定向对方索要')", source)
 
     def test_multi_value_normalization(self) -> None:
         values = FilterMixin.split_multi_values("本科，硕士、博士; 本科")
