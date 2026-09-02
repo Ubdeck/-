@@ -13,7 +13,6 @@ let refreshJobsTimer = null;
 let updatePollTimer = null;
 let notificationQueue = [];
 let notificationOpen = false;
-let customMatchRequirements = "";
 let templateDraftId = "";
 const handledNotificationIds = new Set();
 const fieldIds = [
@@ -24,7 +23,7 @@ const fieldIds = [
   "experience", "recruitment_type", "active_status", "job_status",
   "job_hop_frequency", "age_min", "age_max", "gender_requirement", "language_requirement",
   "graduation_year", "ai_provider", "deepseek_api_key", "company_model_api_key", "deepseek_model",
-  "candidate_limit", "maimai_page_limit", "maimai_auto_communicate", "ai_template_id", "match_requirements",
+  "candidate_limit", "maimai_page_limit", "maimai_auto_communicate", "ai_template_id",
   "use_keywords_ai_words", "use_job_ai_words", "use_company_ai_words", "auto_communicate",
   "request_resume_after_communicate", "request_phone_after_communicate"
 ];
@@ -98,7 +97,7 @@ function renderTasks() {
 function templateName(task) {
   const id = task?.config?.ai_template_id;
   const template = (state.ai_templates || []).find(item => item.id === id);
-  return template ? template.name : "本任务自定义提示词";
+  return template ? template.name : "未绑定 AI 模板";
 }
 function fillSelect(id, selected) {
   document.getElementById(id).innerHTML = optionHtml(state.options[id] || [""], selected || "");
@@ -170,7 +169,6 @@ function fillForm(task) {
   scheduleTimes = normalizeTimes(task.times || []);
   renderScheduleTimes();
   for (const id of Object.keys(state.options || {})) fillSelect(id, cfg[id]);
-  customMatchRequirements = cfg.ai_template_id ? "" : (cfg.match_requirements || "").trim();
   renderCheckboxGroup("education", state.options.education || [], cfg.education || []);
   renderJobSelect(cfg);
   const schools = ["211", "985", "双一流", "海外留学"];
@@ -182,11 +180,9 @@ function fillForm(task) {
     const ele = document.getElementById(id);
     if (!ele) continue;
     if (ele.type === "checkbox") ele.checked = !!cfg[id];
-    else if (id === "match_requirements" && (cfg[id] || "").trim() === (state.defaults.match_requirements || "").trim()) ele.value = "";
     else ele.value = cfg[id] ?? "";
   }
   renderTemplateSelect(cfg);
-  applyTemplateUI();
   currentIndustries = normalizeIndustries(cfg.current_industries || []);
   expectedIndustries = normalizeIndustries(cfg.expected_industries || []);
   currentFunctions = normalizeIndustries(cfg.current_functions || []);
@@ -206,6 +202,11 @@ function readForm() {
   if (cfg.ai_template_id) {
     const template = (state.ai_templates || []).find(item => item.id === cfg.ai_template_id);
     if (template) cfg.match_requirements = template.prompt;
+  } else {
+    const savedConfig = activeTask()?.config || {};
+    cfg.match_requirements = savedConfig.ai_template_id
+      ? state.defaults.match_requirements
+      : (savedConfig.match_requirements || state.defaults.match_requirements);
   }
   cfg.candidate_limit = Number(cfg.candidate_limit || 1);
   cfg.maimai_page_limit = Number(cfg.maimai_page_limit || 1);
@@ -233,37 +234,9 @@ function renderTemplateSelect(cfg = {}) {
   const select = document.getElementById("ai_template_id");
   if (!select) return;
   const selected = cfg.ai_template_id || "";
-  select.innerHTML = `<option value="">本任务自定义提示词</option>` + (state.ai_templates || []).map(item =>
+  select.innerHTML = `<option value="">未绑定 AI 模板</option>` + (state.ai_templates || []).map(item =>
     `<option value="${escapeHtml(item.id)}"${item.id === selected ? " selected" : ""}>${escapeHtml(item.name)}</option>`
   ).join("");
-}
-function applyTemplateUI() {
-  const select = document.getElementById("ai_template_id");
-  const prompt = document.getElementById("match_requirements");
-  const hint = document.getElementById("templateHint");
-  if (!select || !prompt) return;
-  const template = (state.ai_templates || []).find(item => item.id === select.value);
-  prompt.disabled = false;
-  if (template) {
-    prompt.value = template.prompt || "";
-    if (hint) hint.textContent = `${template.description || "已绑定模板"} 可直接修改本框，修改后会转为本任务自定义，不影响共享模板。`;
-  } else {
-    prompt.value = customMatchRequirements || "";
-    if (hint) hint.textContent = "本任务独立使用下面的提示词，不会影响其他任务。";
-  }
-}
-function onPromptInput() {
-  const select = document.getElementById("ai_template_id");
-  const prompt = document.getElementById("match_requirements");
-  if (!select || !prompt || !select.value) return;
-  customMatchRequirements = prompt.value;
-  select.value = "";
-  applyTemplateUI();
-}
-function onTemplateChange() {
-  const prompt = document.getElementById("match_requirements");
-  if (prompt && !prompt.disabled && prompt.value.trim()) customMatchRequirements = prompt.value.trim();
-  applyTemplateUI();
 }
 function openTemplateManager() {
   document.getElementById("templateManager").classList.add("open");
@@ -314,7 +287,6 @@ async function saveTemplateDraft() {
   await loadState(true);
   renderTemplateManager();
   renderTemplateSelect({ai_template_id: selectedTemplateId});
-  applyTemplateUI();
   alert("模板已保存。已绑定该模板的任务会在下次运行时使用最新提示词。");
 }
 async function deleteTemplateDraft() {
@@ -325,7 +297,6 @@ async function deleteTemplateDraft() {
   templateDraftId = state.ai_templates.find(value => value.id !== item.id)?.id || "";
   await loadState(true);
   renderTemplateSelect(activeTask()?.config || {});
-  applyTemplateUI();
   renderTemplateManager();
 }
 async function renameTask(id) {
