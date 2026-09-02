@@ -175,7 +175,10 @@
               <label for="ai_template_id">AI筛选模板</label>
               <button type="button" class="secondary compact-button" onclick="openTemplateManager()">管理模板</button>
             </div>
-            <select id="ai_template_id"></select>
+            <select id="ai_template_id" onchange="onTemplateChange()"></select>
+            <div id="templateHint" class="hint"></div>
+            <label for="match_requirements" class="prompt-label">本任务提示词</label>
+            <textarea id="match_requirements" oninput="onPromptInput()" placeholder="选择模板后自动带入模板提示词；也可以直接修改，修改后会转为本任务自定义。"></textarea>
           </div>
         </div>
       </section>
