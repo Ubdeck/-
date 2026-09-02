@@ -330,6 +330,16 @@ class LiepinCoreTests(unittest.TestCase):
         self.assertEqual(second["config"]["selected_chat_job"]["job_id"], "job-b")
         self.assertEqual(state.find_task(first_id)["config"]["selected_chat_job"]["job_id"], "job-a")
 
+    def test_tasks_keep_independent_custom_prompts(self) -> None:
+        state = AppState()
+        first_id = state.data["tasks"][0]["id"]
+        with patch.object(state, "save"):
+            first = state.save_task({"id": first_id, "name": "销售任务", "config": {"ai_template_id": "", "match_requirements": "销售任务只看企业客户经验。"}})
+            second = state.save_task({"name": "技术任务", "config": {"ai_template_id": "", "match_requirements": "技术任务只看 Python 项目经验。"}})
+        self.assertEqual(first["config"]["match_requirements"], "销售任务只看企业客户经验。")
+        self.assertEqual(second["config"]["match_requirements"], "技术任务只看 Python 项目经验。")
+        self.assertEqual(state.find_task(first_id)["config"]["match_requirements"], "销售任务只看企业客户经验。")
+
     def test_scheduled_tasks_are_dispatched_in_order(self) -> None:
         state = AppState()
         first_id = state.data["tasks"][0]["id"]
