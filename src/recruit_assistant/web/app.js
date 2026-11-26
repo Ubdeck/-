@@ -153,7 +153,9 @@ function applyAiProviderUI(resetModel = false) {
 function renderJobSelect(cfg = null) {
   const jobSelect = document.getElementById("selected_chat_job");
   if (!jobSelect) return;
-  const savedJob = cfg?.selected_chat_job || null;
+  const savedJob = cfg === null
+    ? JSON.parse(jobSelect.selectedOptions[0]?.dataset.job || "null")
+    : cfg.selected_chat_job || null;
   const selectedJobKey = cfg === null ? jobSelect.value : jobKey(savedJob);
   const jobs = [...(state.jobs || [])];
   if (savedJob && !jobs.some(job => jobKey(job) === selectedJobKey)) jobs.unshift(savedJob);
@@ -161,7 +163,7 @@ function renderJobSelect(cfg = null) {
     const key = jobKey(job);
     const label = formatJobLabel(job);
     const suffix = savedJob === job && !(state.jobs || []).some(item => jobKey(item) === key) ? "（已保存）" : "";
-    return `<option value="${escapeHtml(key)}"${key === selectedJobKey ? " selected" : ""}>${escapeHtml(label + suffix)}</option>`;
+    return `<option value="${escapeHtml(key)}" data-job="${escapeHtml(JSON.stringify(job))}"${key === selectedJobKey ? " selected" : ""}>${escapeHtml(label + suffix)}</option>`;
   }).join("");
 }
 function fillForm(task) {
@@ -219,10 +221,10 @@ function readForm() {
   cfg.current_functions = normalizeIndustries(currentFunctions);
   cfg.expected_functions = normalizeIndustries(expectedFunctions);
   const selectedJobKey = document.getElementById("selected_chat_job").value;
-  const savedJob = activeTask()?.config?.selected_chat_job || null;
+  const savedJob = JSON.parse(document.getElementById("selected_chat_job").selectedOptions[0]?.dataset.job || "null");
   cfg.selected_chat_job = cfg.platform === "liepin"
     ? ((state.jobs || []).find(job => jobKey(job) === selectedJobKey)
-      || (jobKey(savedJob) === selectedJobKey ? {...savedJob} : null))
+      || (savedJob && jobKey(savedJob) === selectedJobKey ? savedJob : null))
     : null;
   return {
     id: activeTaskId || undefined,
@@ -661,7 +663,7 @@ function renderResults() {
       <td>${escapeHtml(candidateIndex(item))}</td>
       <td>${escapeHtml(item.name || "")}</td>
       <td>${escapeHtml(candidateSummary(item))}</td>
-      <td><span class="tag ${item.match === true ? "ok" : (item.match === false ? "bad" : "mid")}">${item.match === true ? "匹配" : (item.match === false ? "不匹配" : "已提取")}</span></td>
+      <td><span class="tag ${item.match === true ? "ok" : (item.match === false ? "bad" : "mid")}">${item.decision === "unread" ? "未读取" : item.match === true ? "匹配" : (item.match === false ? "不匹配" : "已提取")}</span></td>
       <td>${escapeHtml(item.score ?? (item.page_number ? `第${item.page_number}页` : 0))}</td>
       <td title="${escapeHtml(candidateActionTitle(item))}">${escapeHtml(candidateAction(item, mapComm, mapPhone, mapResume))}</td>
       <td>
@@ -680,6 +682,7 @@ function candidateSummary(item) {
   return [firstLine(item.basic_info), firstLine(item.expectation)].filter(Boolean).join(" / ");
 }
 function candidateAction(item, mapComm, mapPhone, mapResume) {
+  if (item.decision === "unread") return "已跳过";
   const action = [mapComm[item.communicate_status] || item.communicate_status || "", mapPhone[item.phone_request_status] || "", mapResume[item.resume_request_status] || ""]
     .filter(Boolean).join(" / ");
   if (action) return action;

@@ -1,6 +1,6 @@
 # 招聘工具
 
-一个面向 Windows 的多渠道招聘自动化桌面工具，通过 DrissionPage 接管本机已登录的 Chromium 浏览器。桌面界面由 `pywebview` 承载，当前支持猎聘已跑通流程，并开始接入脉脉招聘渠道；DeepSeek 或公司模型用于候选人匹配判断。
+一个面向 Windows 的多渠道招聘自动化桌面工具，通过 DrissionPage 接管本机已登录的 Chromium 浏览器。桌面界面由 `pywebview` 承载，支持猎聘和脉脉的搜索、候选人筛选及沟通流程；DeepSeek 或公司模型用于候选人匹配判断。
 
 > 项目目前处于 Alpha 阶段。它依赖招聘网站的页面结构，不使用平台官方 API；网站改版后可能需要更新选择器。真实发送会对候选人产生实际影响，开发和验证时请保持测试模式。
 
@@ -73,7 +73,7 @@ src/recruit_assistant/
       filters.py              # 搜索筛选控件
       models.py               # 配置和进度模型
     maimai/
-      automation.py           # 脉脉招聘流程门面，当前先接入人才主界面
+      automation.py           # 脉脉搜索、按页读取档案和沟通
       browser.py              # 脉脉 CDP 浏览器连接
       constants.py            # 脉脉主界面 URL 和运行目录
 tests/                        # 不触发真实平台操作的单元测试
@@ -104,7 +104,7 @@ powershell -ExecutionPolicy Bypass -File .\build_exe.ps1
 
 ## 自动更新
 
-软件会通过 GitHub Releases 检查最新版本。发布新版本时创建 `v0.1.1` 这类 tag，GitHub Actions 会自动构建 Windows exe 并上传到对应 Release；同事安装过一次带更新功能的版本后，可以在软件里点击“检查更新”完成下载、替换和重启。
+软件会通过 GitHub Releases 检查最新版本。发布新版本时创建 `v0.1.1` 这类 tag，GitHub Actions 会自动构建 Windows exe 并上传到对应 Release；同事安装过一次带更新功能的版本后，可以在软件里点击“检查更新”下载并安装，安装结束后手动重新打开软件。
 
 更新测试记录：`v0.1.2` 用于验证 GitHub Release 自动更新链路。
 

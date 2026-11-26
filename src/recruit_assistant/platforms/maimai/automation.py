@@ -17,6 +17,33 @@ COMPANY_PLACEHOLDER = "请输入就职公司"
 KEYWORD_PLACEHOLDER = '搜索提示：输入带双引号的完整词组，如"算法工程师"，可精准匹配人才'
 
 
+# Shared by drawer discovery, tab selection and resume extraction.
+CANDIDATE_DRAWER_JS = """
+    const visible = e => e.getBoundingClientRect().width > 0
+      && e.getBoundingClientRect().height > 0 && getComputedStyle(e).visibility !== 'hidden';
+    const drawer = [...document.querySelectorAll('.ant-drawer-open .ant-drawer-content')]
+      .reverse().find(e => visible(e) && e.querySelector('[class*=talent-list]'));
+    const list = drawer && drawer.querySelector('[class*=talent-list]');
+    const cards = list ? [...list.querySelectorAll('[class*=card___]')]
+      .filter(e => e.querySelector('[class*=name___]')) : [];
+"""
+
+CANDIDATE_PROFILE_JS = CANDIDATE_DRAWER_JS + """
+    const panels = drawer ? [...drawer.querySelectorAll('[class*=left___]')]
+      .filter(e => visible(e) && !list.contains(e) && !e.contains(list)) : [];
+    const titleOf = e => [...e.querySelectorAll('[class*=showNameStyle], [class*=font_title]')]
+      .find(visible);
+    const sections = ['期望偏好', '工作经历', '教育经历', '项目经历', '附件简历'];
+    const hasSections = e => (e.innerText || '').split(/\\r?\\n/)
+      .some(line => sections.includes(line.trim()));
+    const detail = panels.find(e => titleOf(e) && hasSections(e));
+"""
+
+
+class CandidateDetailError(RuntimeError):
+    """The selected candidate's resume could not be verified."""
+
+
 class MaimaiRecruitPage(MaimaiAiMatcherMixin):
     """Facade for the Maimai recruiting workflow."""
 
@@ -58,6 +85,7 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
         return {
             "status": "batch_completed" if results else "filters_applied",
             "processed": len(results),
+            "skipped": sum(1 for item in results if item.get("decision") == "unread"),
             "matched": matched,
             "results": results,
             **state,
@@ -298,21 +326,22 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
             time.sleep(0.25)
         raise RuntimeError(f"脉脉搜索按钮点击失败：{last_result}")
 
-    def open_first_candidate(self, timeout: float = 12.0) -> dict:
+    def open_first_candidate(self, timeout: float = 30.0) -> dict:
         self.emit("maimai_candidate", "搜索完成，正在打开第一个候选人")
         deadline = time.time() + timeout
         last_result = None
+        clicks = 0
+        retry_after = 0.0
+        first_name = ""
         while time.time() < deadline:
+            self.check_stopped()
             last_result = self.page.run_js(
-                """
-                const visible = ele => {
-                  const rect = ele.getBoundingClientRect();
-                  const style = getComputedStyle(ele);
-                  return rect.width > 0 && rect.height > 0
-                    && style.display !== 'none' && style.visibility !== 'hidden';
-                };
+                CANDIDATE_DRAWER_JS + """
+                if (cards.length) return {ready: true};
+                const openDrawer = [...document.querySelectorAll('.ant-drawer-open .ant-drawer-content')].some(visible);
+                if (openDrawer || !arguments[0]) return {reason: '卡片已点击，等待详情窗口中的候选人列表'};
                 const clean = ele => (ele.innerText || ele.textContent || '').trim().replace(/\s+/g, ' ');
-                const cards = Array.from(document.querySelectorAll(
+                const searchCards = Array.from(document.querySelectorAll(
                   '.talent-common-card, [class*=talent-common-card], [class*=talent-card]'
                 ))
                   .filter(visible)
@@ -326,42 +355,39 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
                       name: name ? clean(name) : ''
                     };
                   })
-                  .filter(item => item.text && item.rect.top >= 0 && item.rect.top < window.innerHeight)
+                  .filter(item => item.text)
                   .sort((a, b) => (a.rect.top - b.rect.top) || (a.rect.left - b.rect.left));
-                const target = cards[0];
+                const target = searchCards[0];
                 if (!target) {
-                  return {ok: false, reason: 'candidate card not found'};
+                  return {ok: false, reason: '搜索结果尚无可见候选人卡片', path: location.pathname};
                 }
                 const ele = target.ele;
                 ele.scrollIntoView({block: 'center', inline: 'nearest'});
-                const clickTarget = ele.querySelector('[class*=name___], .like-link-button') || ele;
-                for (const name of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
-                  clickTarget.dispatchEvent(new MouseEvent(name, {
-                    bubbles: true,
-                    cancelable: true,
-                    composed: true,
-                    view: window,
-                  }));
-                }
-                if (clickTarget !== ele) ele.click();
+                const nameLink = ele.querySelector('[class*=name___], .like-link-button');
+                const clickTarget = arguments[1] || !nameLink ? ele : nameLink;
+                clickTarget.click();
                 return {
                   ok: true,
                   name: target.name,
-                  text: target.text.slice(0, 240)
                 };
-                """
+                """,
+                time.monotonic() >= retry_after,
+                clicks % 2 == 1,
             )
-            if last_result and last_result.get("ok"):
-                time.sleep(0.6)
-                self.wait_for_candidate_detail()
+            if last_result and last_result.get("ready"):
                 return {
                     "candidate_opened": True,
-                    "candidate_name": str(last_result.get("name") or ""),
+                    "candidate_name": first_name,
                     "candidate_view": "detail",
                 }
+            if last_result and last_result.get("ok"):
+                clicks += 1
+                retry_after = time.monotonic() + 5
+                first_name = str(last_result.get("name") or "")
             self.check_stopped()
             time.sleep(0.25)
-        raise RuntimeError(f"脉脉第一个候选人打开失败：{last_result}")
+        reason = (last_result or {}).get("reason") or "详情窗口未就绪"
+        raise RuntimeError(f"脉脉候选人列表打开超时：{reason}（已点击 {clicks} 次）。")
 
     def run_communication_smoke_test(self, candidate_limit: int = 5, greeting: str = "") -> list[dict]:
         """Run a bounded live communication check against candidates already shown in the drawer."""
@@ -403,37 +429,17 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
             results.append(item)
         return results
 
-    def wait_for_candidate_detail(self, timeout: float = 8.0) -> None:
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            state = self.page.run_js(
-                """
-                const visible = ele => {
-                  const rect = ele.getBoundingClientRect();
-                  const style = getComputedStyle(ele);
-                  return rect.width > 0 && rect.height > 0
-                    && style.display !== 'none' && style.visibility !== 'hidden';
-                };
-                const bodyText = document.body ? (document.body.innerText || '') : '';
-                const detail = Array.from(document.querySelectorAll('[class*=left___], .ant-drawer-body'))
-                  .filter(visible)
-                  .map(ele => {
-                    const rect = ele.getBoundingClientRect();
-                    const text = (ele.innerText || ele.textContent || '').trim();
-                    return {rect, text};
-                  })
-                  .filter(item => item.rect.left > 350 && item.rect.width > 240 && item.text.length > 20)
-                  .sort((a, b) => b.rect.width - a.rect.width)[0];
-                const hasDetailMarker = ['人才档案', '期望偏好', '基本信息', '工作经历', '教育经历']
-                  .some(text => bodyText.includes(text));
-                return !!detail && hasDetailMarker;
-                """
-            )
-            if state:
-                return
+    def wait_for_candidate_detail(self, timeout: float = 15.0) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
             self.check_stopped()
+            try:
+                if self.page.run_js(CANDIDATE_DRAWER_JS + "return cards.length > 0;"):
+                    return
+            except (ContextLostError, ElementLostError):
+                pass
             time.sleep(0.2)
-        raise RuntimeError("脉脉候选人详情界面未打开。")
+        raise RuntimeError("脉脉候选人列表尚未在详情窗口中加载。")
 
     def extract_candidate_resumes_by_pages(self, page_limit: int = 1) -> list[dict]:
         self.wait_for_candidate_detail()
@@ -477,16 +483,17 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
                 break
             visited_signatures.add(signature)
             self.emit("maimai_candidate", f"正在提取第 {page_number}/{page_limit} 页候选人简历")
-            page_resumes = self.extract_current_page_resumes_once(candidates)
+            page_resumes = self.extract_current_page_resumes_once(candidates, keep_unread=True)
             page_start_index = len(results)
             for offset, resume in enumerate(page_resumes, start=1):
                 resume["page_number"] = page_number
                 resume["global_candidate_index"] = page_start_index + offset
-            self.emit("maimai_candidates_done", f"第 {page_number} 页候选人简历已提取：{len(page_resumes)} 人")
-            page_ai = self.analyze_current_page_candidates(page_resumes, config)
-            page_results = page_ai.get("results", []) if isinstance(page_ai, dict) else []
+            unread = [item for item in page_resumes if item.get("decision") == "unread"]
+            readable = [item for item in page_resumes if item.get("decision") != "unread"]
+            self.emit("maimai_candidates_done", f"第 {page_number} 页已提取 {len(readable)} 份简历，跳过 {len(unread)} 人")
+            page_results = self.analyze_current_page_candidates(readable, config)["results"] if readable else []
             self.communicate_matched_candidates_on_current_page(page_results, candidates, config)
-            for item in page_results:
+            for item in sorted(page_results + unread, key=lambda row: row["page_candidate_index"]):
                 item["page_number"] = item.get("page_number") or page_number
                 item["global_candidate_index"] = len(results) + 1
                 results.append(item)
@@ -1423,114 +1430,81 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
         self.emit("maimai_candidates_done", f"本页候选人简历已提取：{len(resumes)} 人")
         return resumes
 
-    def extract_current_page_resumes_once(self, candidates: list[dict]) -> list[dict]:
+    def extract_current_page_resumes_once(self, candidates: list[dict], *, keep_unread: bool = False) -> list[dict]:
         total = len(candidates)
         resumes: list[dict] = []
         for index, candidate in enumerate(candidates, start=1):
             self.emit("maimai_candidate", f"正在提取本页候选人简历：{index}/{total}")
-            summary = self.open_drawer_candidate(candidate)
-            resume = self.extract_current_candidate_resume(summary.get("name", ""))
+            try:
+                summary = self.open_drawer_candidate(candidate)
+                resume = self.extract_current_candidate_resume(summary["name"])
+            except CandidateDetailError as exc:
+                self.check_stopped()
+                if not keep_unread:
+                    raise
+                summary = candidate
+                resume = {"name": candidate["name"], "decision": "unread", "next_action": "skip", "reason": str(exc)}
+                self.emit("maimai_candidate", f"本页第 {index} 人详情未确认，已跳过：{exc}")
             resume["page_candidate_index"] = index
             resume["list_summary"] = summary
             resumes.append(resume)
         return resumes
 
     def candidate_page_signature(self, candidates: list[dict]) -> str:
-        def part(item: dict) -> str:
-            name = str(item.get("name") or "")
-            summary = str(item.get("summary") or "").replace("\n", " ")[:80]
-            return f"{name}:{summary}"
+        return "|".join(str(item.get("name") or "") for item in candidates)
 
-        head = [part(item) for item in candidates[:5]]
-        tail = [part(item) for item in candidates[-5:]]
-        return "|".join(head + tail)
-
-    def goto_next_candidate_page(self, previous_signature: str = "", timeout: float = 8.0) -> bool:
-        deadline = time.time() + timeout
-        last_result = None
-        while time.time() < deadline:
-            last_result = self.page.run_js(
+    def goto_next_candidate_page(self, previous_signature: str = "", timeout: float = 15.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self.check_stopped()
+            state = self.page.run_js(
+                CANDIDATE_DRAWER_JS + """
+                const pager = document.querySelector('[class*=paginationCon]');
+                const current = Number(pager?.querySelector('[class*=current]')?.innerText) || 0;
+                const next = pager?.querySelector('[class*=nextPage]');
+                const disabled = e => e.matches('[disabled], [aria-disabled=true], [class*=disabled]');
+                if (next && disabled(next)) return {end: true};
+                if (!list) return {};
+                // In compact layouts the drawer hides its footer, while the main pager stays active.
+                const action = [...list.children].find(e =>
+                  ['跳转至下一页', '下一页'].includes(e.textContent.trim()));
+                if (!action || disabled(action) || (!visible(action) && !(next && current))) return {};
+                action.click();
+                return {clicked: true, current};
                 """
-                const visible = ele => {
-                  const rect = ele.getBoundingClientRect();
-                  const style = getComputedStyle(ele);
-                  return rect.width > 0 && rect.height > 0
-                    && style.display !== 'none' && style.visibility !== 'hidden';
-                };
-                const clean = ele => (ele.innerText || ele.textContent || '').trim().replace(/\\s+/g, ' ');
-                const drawer = document.querySelector('.ant-drawer-open .ant-drawer-content')
-                  || document.querySelector('.ant-drawer-content');
-                if (!drawer) return {ok: false, reason: 'drawer not found'};
-                const disabled = ele => {
-                  const cls = String(ele.className || '');
-                  const aria = String(ele.getAttribute('aria-disabled') || '');
-                  return ele.disabled
-                    || aria === 'true'
-                    || cls.includes('disabled')
-                    || cls.includes('disable')
-                    || ele.closest('[aria-disabled="true"], [disabled], [class*="disabled"], [class*="disable"]');
-                };
-                const items = Array.from(drawer.querySelectorAll('*'))
-                  .filter(visible)
-                  .map(ele => ({ele, text: clean(ele), cls: String(ele.className || ''), rect: ele.getBoundingClientRect(), disabled: !!disabled(ele)}));
-                const controls = items
-                  .filter(item => item.text === '跳转至下一页'
-                    || item.text === '下一页'
-                    || item.cls.includes('next-btn')
-                    || item.cls.includes('nextBtn')
-                    || item.cls.includes('next___'))
-                  .filter(item => !item.disabled)
-                  .sort((a, b) => (a.rect.top - b.rect.top) || (a.rect.left - b.rect.left));
-                const target = controls[0];
-                if (!target) {
-                  return {
-                    ok: false,
-                    reason: 'next page control not found',
-                    controls: items
-                      .filter(item => item.cls.includes('btn') || item.text.includes('页') || item.text.includes('跳转'))
-                      .map(item => ({text: item.text.slice(0, 80), cls: item.cls.slice(0, 80)}))
-                      .slice(0, 20)
-                  };
-                }
-                const ele = target.ele;
-                ele.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true, view: window}));
-                ele.click();
-                ele.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true, view: window}));
-                return {ok: true, text: target.text, cls: target.cls};
-                """
-            )
-            if last_result and last_result.get("ok"):
-                if self.wait_for_candidate_page_changed(previous_signature):
-                    return True
+            ) or {}
+            if state.get("end"):
                 return False
-            self.check_stopped()
-            time.sleep(0.25)
-        self.emit("maimai_candidate", f"脉脉未找到下一页，停止翻页：{last_result}")
-        return False
-
-    def wait_for_candidate_page_changed(self, previous_signature: str, timeout: float = 8.0) -> bool:
-        if not previous_signature:
-            time.sleep(1.0)
-            return True
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            candidates = self.drawer_candidate_descriptors()
-            if candidates and self.candidate_page_signature(candidates) != previous_signature:
+            if state.get("clicked"):
+                self.wait_for_candidate_page_changed(previous_signature, timeout, state.get("current", 0))
                 return True
+            time.sleep(0.25)
+        raise RuntimeError("脉脉翻页失败：未找到可用的下一页，也未确认已到末页。")
+
+    def wait_for_candidate_page_changed(self, previous_signature: str, timeout: float = 15.0, previous_page: int = 0) -> None:
+        deadline = time.monotonic() + timeout
+        stable_signature = ""
+        stable_since = 0.0
+        while time.monotonic() < deadline:
             self.check_stopped()
-            time.sleep(0.3)
-        return False
+            current = self.page.run_js(
+                "return Number(document.querySelector('[class*=paginationCon] [class*=current]')?.innerText) || 0;"
+            )
+            candidates = self.drawer_candidate_descriptors()
+            signature = self.candidate_page_signature(candidates)
+            page_changed = not previous_page or current == previous_page + 1
+            if page_changed and signature and signature != previous_signature:
+                if signature == stable_signature and time.monotonic() - stable_since >= 0.6:
+                    return
+                if signature != stable_signature:
+                    stable_signature, stable_since = signature, time.monotonic()
+            else:
+                stable_signature = ""
+            time.sleep(0.25)
+        raise RuntimeError("脉脉已点击下一页，但新页的候选人列表未确认加载。")
 
     def drawer_candidate_count(self) -> int:
-        value = self.page.run_js(
-            """
-            const drawer = document.querySelector('.ant-drawer-open .ant-drawer-content')
-              || document.querySelector('.ant-drawer-content');
-            const list = drawer && drawer.querySelector('[class*=talent-list]');
-            if (!list) return 0;
-            return Array.from(list.querySelectorAll('[class*=card___3uNBJ]')).length;
-            """
-        )
+        value = self.page.run_js(CANDIDATE_DRAWER_JS + "return cards.length;")
         try:
             return int(value or 0)
         except (TypeError, ValueError):
@@ -1538,16 +1512,12 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
 
     def drawer_candidate_descriptors(self) -> list[dict]:
         value = self.page.run_js(
-            """
-            const clean = ele => (ele.innerText || ele.textContent || '').trim().replace(/\s+/g, ' ');
-            const drawer = document.querySelector('.ant-drawer-open .ant-drawer-content')
-              || document.querySelector('.ant-drawer-content');
-            const list = drawer && drawer.querySelector('[class*=talent-list]');
-            if (!list) return [];
+            CANDIDATE_DRAWER_JS + r"""
+            const clean = ele => ele.innerText.trim().replace(/\s+/g, ' ');
             const seen = new Set();
-            return Array.from(list.querySelectorAll('[class*=card___3uNBJ]'))
+            return cards
               .map(card => {
-                const nameEle = card.querySelector('[class*=name___3HTf0]');
+                const nameEle = card.querySelector('[class*=name___]');
                 return {
                   name: nameEle ? clean(nameEle) : '',
                   summary: clean(card)
@@ -1578,31 +1548,22 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
             self.check_stopped()
             try:
                 last_result = self.page.run_js(
-                """
+                CANDIDATE_DRAWER_JS + r"""
                 const index = Number(arguments[0]);
                 const expectedName = String(arguments[1] || '');
                 const expectedSummary = String(arguments[2] || '');
-                const visible = ele => {
-                  const rect = ele.getBoundingClientRect();
-                  const style = getComputedStyle(ele);
-                  return rect.width > 0 && rect.height > 0
-                    && style.display !== 'none' && style.visibility !== 'hidden';
-                };
-                const clean = ele => (ele.innerText || ele.textContent || '').trim().replace(/\s+/g, ' ');
-                const drawer = document.querySelector('.ant-drawer-open .ant-drawer-content')
-                  || document.querySelector('.ant-drawer-content');
-                const list = drawer && drawer.querySelector('[class*=talent-list]');
+                const clean = ele => ele.innerText.trim().replace(/\s+/g, ' ');
                 if (!list) return {ok: false, reason: 'drawer candidate list not found'};
-                const cards = Array.from(list.querySelectorAll('[class*=card___3uNBJ]'));
                 const cleanName = card => {
-                  const name = card.querySelector('[class*=name___3HTf0]');
+                  const name = card.querySelector('[class*=name___]');
                   return name ? clean(name) : '';
                 };
                 const card = expectedName
                   ? (cards.find(item => cleanName(item) === expectedName
                       && expectedSummary
                       && clean(item) === expectedSummary)
-                    || cards.find(item => cleanName(item) === expectedName))
+                    || (cards.filter(item => cleanName(item) === expectedName).length === 1
+                        && cards.find(item => cleanName(item) === expectedName)))
                   : cards[index];
                 if (!card) return {ok: false, reason: 'drawer candidate card not found', index, count: cards.length};
                 const name = cleanName(card);
@@ -1627,6 +1588,7 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
                     self.ensure_talent_profile_tab(timeout=5.0)
                     self.wait_for_candidate_detail_name(expected_name, timeout=timeout)
                 except RuntimeError as exc:
+                    self.check_stopped()
                     last_result = {
                         "ok": False,
                         "reason": str(exc),
@@ -1641,42 +1603,22 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
                 }
             self.check_stopped()
             time.sleep(0.2)
-        raise RuntimeError(f"脉脉候选人列表点击失败：{last_result}")
+        raise CandidateDetailError(f"候选人详情未能确认：{last_result}")
 
     def ensure_talent_profile_tab(self, timeout: float = 3.0) -> None:
         deadline = time.time() + timeout
         last_state = None
         while time.time() < deadline:
             last_state = self.page.run_js(
-                """
-                const visible = ele => {
-                  const rect = ele.getBoundingClientRect();
-                  const style = getComputedStyle(ele);
-                  return rect.width > 0 && rect.height > 0
-                    && style.display !== 'none' && style.visibility !== 'hidden';
-                };
-                const clean = ele => (ele.innerText || ele.textContent || '').trim().replace(/\\s+/g, ' ');
-                const drawer = document.querySelector('.ant-drawer-open .ant-drawer-content')
-                  || document.querySelector('.ant-drawer-content');
-                if (!drawer) return {ok: false, reason: 'drawer not found'};
-                const left = Array.from(drawer.querySelectorAll('[class*=left___]'))
-                  .filter(visible)
-                  .sort((a, b) => b.getBoundingClientRect().width - a.getBoundingClientRect().width)[0];
-                const detailText = left ? clean(left) : '';
-                if (detailText.includes('期望偏好') || detailText.includes('工作经历') || detailText.includes('教育经历') || detailText.includes('附件简历')) {
-                  return {ok: true, already: true};
-                }
-                const candidates = Array.from(drawer.querySelectorAll('*'))
-                  .filter(visible)
-                  .map(ele => ({ele, text: clean(ele), rect: ele.getBoundingClientRect()}))
-                  .filter(item => item.text === '人才档案' || item.text.startsWith('人才档案 '))
-                  .sort((a, b) => (a.rect.top - b.rect.top) || (a.rect.left - b.rect.left));
-                const target = candidates[0];
-                if (!target) return {ok: false, reason: 'talent profile tab not found', sample: detailText.slice(0, 160)};
-                target.ele.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true, view: window}));
-                target.ele.click();
-                target.ele.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true, view: window}));
-                return {ok: true, clicked: true, text: target.text};
+                CANDIDATE_PROFILE_JS + """
+                if (detail) return {ok: true};
+                if (!drawer) return {ok: false, reason: '详情窗口尚未打开'};
+                const target = [...drawer.querySelectorAll('span, a, button, div, [role=tab]')]
+                  .find(e => visible(e) && !list.contains(e) && e.childElementCount === 0
+                    && e.innerText.trim() === '人才档案');
+                if (!target) return {ok: false, reason: '人才档案页签尚未加载'};
+                target.click();
+                return {ok: true, clicked: true};
                 """
             )
             if last_state and last_state.get("ok"):
@@ -1691,59 +1633,7 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
         state = None
         while time.time() < deadline:
             try:
-                state = self.page.run_js(
-                    """
-                    const expectedName = arguments[0];
-                    const clean = ele => (ele.innerText || ele.textContent || '').trim().replace(/\s+/g, ' ');
-                    const drawer = document.querySelector('.ant-drawer-open .ant-drawer-content')
-                      || document.querySelector('.ant-drawer-content');
-                    const drawerText = drawer ? clean(drawer) : '';
-                    const selectedCard = drawer && Array.from(drawer.querySelectorAll('[class*=talent-list] [class*=card___3uNBJ]'))
-                      .find(ele => {
-                        const style = String(ele.getAttribute('style') || '');
-                        return style.includes('241, 246, 255') || style.includes('51, 117, 255');
-                      });
-                    const selectedName = selectedCard
-                      ? clean(selectedCard.querySelector('[class*=name___3HTf0]') || selectedCard)
-                      : '';
-                    const detailPanel = Array.from(drawer ? drawer.querySelectorAll('[class*=left___]') : [])
-                      .filter(ele => {
-                        const rect = ele.getBoundingClientRect();
-                        const style = getComputedStyle(ele);
-                        return rect.width > 240 && rect.height > 160
-                          && rect.left > 350
-                          && style.display !== 'none'
-                          && style.visibility !== 'hidden'
-                          && clean(ele).length > 20;
-                      })
-                      .sort((a, b) => b.getBoundingClientRect().width - a.getBoundingClientRect().width)[0];
-                    const detailText = detailPanel ? clean(detailPanel) : '';
-                    const lines = detailText.split(/\\s+/).filter(Boolean);
-                    const detailNameEle = detailPanel && (
-                      detailPanel.querySelector('[class*=showNameStyle]')
-                      || detailPanel.querySelector('[class*=font_title]')
-                    );
-                    const detailName = detailNameEle ? clean(detailNameEle) : (lines[0] || '');
-                    const hasResumeMarker = ['期望偏好', '工作经历', '教育经历', '附件简历']
-                      .some(text => detailText.includes(text));
-                    const isDynamicTab = detailText.startsWith('人才档案 职位记录')
-                      && detailText.includes('实名动态')
-                      && !hasResumeMarker;
-                    const nameMatches = !expectedName || detailName === expectedName || detailText.startsWith(expectedName + ' ');
-                    const hasDetail = !!detailPanel && nameMatches && hasResumeMarker && !isDynamicTab;
-                    return {
-                      ready: hasDetail,
-                      currentName: selectedName,
-                      detailName,
-                      name_matches: nameMatches,
-                      has_detail: hasDetail,
-                      detail_panel: !!detailPanel,
-                      has_resume_marker: hasResumeMarker,
-                      sample: detailText.slice(0, 180)
-                    };
-                    """,
-                    expected_name,
-                )
+                state = self._extract_current_candidate_resume_once(expected_name, check_only=True)
             except (ContextLostError, ElementLostError):
                 time.sleep(0.25)
                 continue
@@ -1752,11 +1642,12 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
                     time.sleep(0.25)
                     continue
                 raise
-            if state and state.get("ready"):
+            if state and state.get("ok"):
                 return
             self.check_stopped()
             time.sleep(0.2)
-        raise RuntimeError(f"脉脉候选人详情未切换到：{expected_name}，{state}")
+        raise CandidateDetailError(f"详情姓名或简历栏目尚未就绪：{expected_name}，{state}")
+
     def extract_current_candidate_resume(self, expected_name: str = "") -> dict:
         last_error = None
         for _ in range(35):
@@ -1775,18 +1666,18 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
                     raise
             self.check_stopped()
             time.sleep(0.35)
-        raise RuntimeError(f"脉脉候选人简历提取失败：{last_error}")
+        raise CandidateDetailError(f"脉脉候选人简历提取失败：{last_error}")
 
-    def _extract_current_candidate_resume_once(self, expected_name: str = "") -> dict:
+    def _extract_current_candidate_resume_once(self, expected_name: str = "", *, check_only: bool = False) -> dict:
         data = self.page.run_js(
-            """
-            const expectedName = String(arguments[0] || '');
-            const visible = ele => {
-              const rect = ele.getBoundingClientRect();
-              const style = getComputedStyle(ele);
-              return rect.width > 0 && rect.height > 0
-                && style.display !== 'none' && style.visibility !== 'hidden';
-            };
+            CANDIDATE_PROFILE_JS + """
+            const expectedName = String(arguments[0] || '').trim();
+            if (!detail) return {ok: false, reason: drawer ? '简历内容尚未加载' : '详情窗口尚未打开'};
+            const name = titleOf(detail).innerText.trim();
+            if (!name || (expectedName && name !== expectedName)) {
+              return {ok: false, reason: '详情姓名与目标不一致'};
+            }
+            if (arguments[1]) return {ok: true};
             const cleanText = value => String(value || '')
               .replace(/\u00a0/g, ' ')
               .replace(/[ \t]+/g, ' ')
@@ -1807,44 +1698,11 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
               }
               return lines.slice(start + 1, end).join('\\n').trim();
             };
-            const drawer = document.querySelector('.ant-drawer-open .ant-drawer-content')
-              || document.querySelector('.ant-drawer-content');
-            const detail = drawer && Array.from(drawer.querySelectorAll('[class*=left___]'))
-              .filter(visible)
-                .find(ele => {
-                  const rect = ele.getBoundingClientRect();
-                  const text = ele.innerText || ele.textContent || '';
-                  return rect.left > 350 && rect.width > 240 && text.trim().length > 20;
-                });
-            if (!detail) return {ok: false, reason: 'candidate detail panel not found'};
             const rawText = cleanText(detail.innerText || detail.textContent || '');
             const lines = linesOf(rawText);
             const headings = ['期望偏好', '工作经历', '教育经历', '项目经历', '职业标签', '更多资料'];
-            const selectedCard = drawer.querySelector('[class*=talent-list] [class*=card___3uNBJ][style*="rgb(241, 246, 255)"]')
-              || drawer.querySelector('[class*=talent-list] [class*=card___3uNBJ][style*="51, 117, 255"]');
-            const selectedNameEle = selectedCard && selectedCard.querySelector('[class*=name___3HTf0]');
-            const nameEle = detail.querySelector('[class*=showNameStyle]')
-              || detail.querySelector('[class*=font_title]')
-              || selectedNameEle;
-            const name = nameEle ? cleanText(nameEle.innerText || nameEle.textContent || '') : (lines[0] || '');
-            const hasResumeMarker = ['期望偏好', '工作经历', '教育经历', '附件简历']
-              .some(text => rawText.includes(text));
-            const isDynamicTab = rawText.startsWith('人才档案\\n职位记录')
-              && rawText.includes('实名动态')
-              && !hasResumeMarker;
-            const nameMatches = !expectedName || name === expectedName || rawText.startsWith(expectedName + '\\n');
-            if (!nameMatches || !hasResumeMarker || isDynamicTab) {
-              return {
-                ok: false,
-                reason: 'candidate resume not ready',
-                expectedName,
-                name,
-                nameMatches,
-                hasResumeMarker,
-                isDynamicTab,
-                sample: rawText.slice(0, 180)
-              };
-            }
+            const selectedCard = cards.find(e => e.querySelector('[class*=name___]').innerText.trim() === name
+              && (e.matches('[aria-selected=true]') || /241, 246, 255|51, 117, 255/.test(e.getAttribute('style') || '')));
             const headerText = cleanText((drawer.querySelector('.ant-drawer-header') || drawer).innerText || '');
             const match = headerText.match(/\((\d+)\s*\/\s*(\d+)\)/);
             return {
@@ -1864,6 +1722,7 @@ class MaimaiRecruitPage(MaimaiAiMatcherMixin):
             };
             """,
             expected_name,
+            check_only,
         )
         return data
 

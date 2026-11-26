@@ -7,8 +7,62 @@ from datetime import datetime
 from urllib import request
 
 from DrissionPage import ChromiumOptions, ChromiumPage
+from DrissionPage.errors import ContextLostError
 
-from .constants import DEFAULT_BROWSER_PORT, RUNTIME_DIR
+from .constants import COMPANY_PLACEHOLDER, DEFAULT_BROWSER_PORT, JOB_PLACEHOLDER, KEYWORDS_PLACEHOLDER, RUNTIME_DIR, SEARCH_URL
+
+
+def open_ordinary_search(page, *, check_stopped=None, allow_login=False) -> None:
+    page.get(SEARCH_URL)
+    deadline = time.monotonic() + 20
+    ready_since = None
+    next_click = 0.0
+    status = ""
+    while time.monotonic() < deadline:
+        if check_stopped:
+            check_stopped()
+        now = time.monotonic()
+        try:
+            status = page.run_js(
+                """
+                const [mayClick, ...placeholders] = arguments;
+                const visible = e => e.getBoundingClientRect().width > 0
+                  && e.getBoundingClientRect().height > 0 && getComputedStyle(e).visibility === 'visible';
+                if (/login|passport/i.test(location.hostname + location.pathname)) return 'login';
+                if (location.origin !== 'https://lpt.liepin.com') return 'loading';
+                const path = location.pathname.replace(/\\/$/, '');
+                const tab = [...document.querySelectorAll('[role=tab]')]
+                  .find(e => visible(e) && e.innerText.trim() === '普通搜索');
+                if (path === '/ai-search' && tab && mayClick) {
+                  tab.click();
+                  return 'switching';
+                }
+                if (path !== '/search' || (tab && tab.getAttribute('aria-selected') !== 'true')) {
+                  return 'waiting for ordinary search';
+                }
+                const inputs = [...document.querySelectorAll('input[placeholder]')]
+                  .filter(e => visible(e) && !e.disabled && !e.readOnly);
+                return placeholders.every(p => inputs.some(e => e.placeholder === p)) ? 'ready' : 'loading';
+                """,
+                now >= next_click, KEYWORDS_PLACEHOLDER, JOB_PLACEHOLDER, COMPANY_PLACEHOLDER,
+            )
+        except ContextLostError:
+            status = "loading"
+        if status == "login":
+            if allow_login:
+                return
+            raise RuntimeError("请先登录猎聘，再运行任务。")
+        if status == "switching":
+            next_click = now + 1.5
+        if status == "ready":
+            if ready_since is None:
+                ready_since = now
+            elif now - ready_since >= 1:
+                return
+        else:
+            ready_since = None
+        time.sleep(0.2)
+    raise RuntimeError(f"未能进入猎聘普通搜索或筛选表单尚未就绪（{status}）。")
 
 
 def append_runtime_log(message: str) -> None:

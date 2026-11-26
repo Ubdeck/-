@@ -21,6 +21,13 @@ jobs:
       - name: Build exe
         shell: pwsh
         run: .\build_exe.ps1
+      - name: Test the release sources and version
+        shell: pwsh
+        run: |
+          $env:PYTHONPATH = (Resolve-Path .\src).Path
+          .\.venv\Scripts\python.exe -m unittest discover -s tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\.venv\Scripts\python.exe -c "import os; from recruit_assistant.version import APP_VERSION; assert os.environ['GITHUB_REF_NAME'] == 'v' + APP_VERSION"
       - name: Publish GitHub Release
         shell: pwsh
         env:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 
+from .browser import open_ordinary_search
 from .constants import (
     ACTIVE_STATUS_TITLE,
     COMPANY_PLACEHOLDER,
@@ -24,7 +25,6 @@ from .constants import (
     RECRUITMENT_TYPE_TITLE,
     RUNTIME_DIR,
     SCHOOL_TYPE_TITLE,
-    SEARCH_URL,
 )
 from .models import SearchFilters
 
@@ -32,10 +32,7 @@ from .models import SearchFilters
 class WorkflowMixin:
     def open(self) -> None:
         self.check_stopped()
-        self.page.get(SEARCH_URL)
-        self.wait_for_input(KEYWORDS_PLACEHOLDER)
-        self.wait_for_input(JOB_PLACEHOLDER)
-        self.wait_for_input(COMPANY_PLACEHOLDER)
+        open_ordinary_search(self.page, check_stopped=self.check_stopped)
 
     def apply_filters(self, filters: SearchFilters) -> dict:
         self.check_stopped()

@@ -217,7 +217,7 @@ class MaimaiAiMatcherMixin:
         normalized_results: list[dict] = []
         for offset, item in enumerate(results, start=1):
             ai_item = by_index.get(self.safe_int(item.get("page_candidate_index")) or offset)
-            if ai_item is None and offset - 1 < len(sequential):
+            if ai_item is None and not by_index and len(sequential) == len(results):
                 ai_item = sequential[offset - 1]
             decision = self.normalize_single_result(item, ai_item)
             normalized_results.append(decision)

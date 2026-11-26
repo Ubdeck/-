@@ -6,13 +6,13 @@ import threading
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from recruit_assistant.environment import parse_env_file
 from recruit_assistant.app_backend import AppState, DEFAULT_AI_TEMPLATE_ID, browser_port_candidates, default_ai_templates, new_task, normalize_company_model, normalize_config, normalize_platform, platform_home_url, select_browser_port
 from recruit_assistant.model_config import messages_for_endpoint, resolve_model_endpoint
 from recruit_assistant.platforms.liepin.ai_matcher import AiMatcherMixin
-from recruit_assistant.platforms.liepin.browser import same_site_url
+from recruit_assistant.platforms.liepin.browser import open_ordinary_search, same_site_url
 from recruit_assistant.platforms.liepin.candidates import CandidateMixin
 from recruit_assistant.platforms.liepin.communication import CommunicationMixin
 from recruit_assistant.platforms.liepin.constants import DEFAULT_MATCH_REQUIREMENTS, RUNTIME_DIR
@@ -20,12 +20,21 @@ from recruit_assistant.platforms.liepin.filters import FilterMixin
 from recruit_assistant.platforms.liepin.models import BatchProgress, SearchFilters
 from recruit_assistant.platforms.liepin.workflow import WorkflowMixin
 from recruit_assistant.platforms.maimai.ai_matcher import MaimaiAiMatcherMixin
-from recruit_assistant.platforms.maimai.automation import MaimaiRecruitPage
+from recruit_assistant.platforms.maimai.automation import CandidateDetailError, MaimaiRecruitPage
 from recruit_assistant.platforms.maimai.constants import DEFAULT_MAIMAI_MATCH_REQUIREMENTS, MAIMAI_TALENTS_URL
 from recruit_assistant.updater import install_downloaded_update, launch_update_installer_and_exit
 
 
 class LiepinCoreTests(unittest.TestCase):
+    def test_ordinary_search_waits_through_ai_redirect_and_form_reload(self) -> None:
+        page = Mock()
+        states = ["ready", "switching", "loading", "ready", "ready", "ready"]
+        page.run_js.side_effect = states
+        with patch("recruit_assistant.platforms.liepin.browser.time") as clock:
+            clock.monotonic.side_effect = lambda: clock.sleep.call_count * 0.5
+            open_ordinary_search(page)
+        self.assertEqual(page.run_js.call_count, len(states))
+
     def test_runtime_directory_is_at_repository_root(self) -> None:
         repository_root = Path(__file__).resolve().parents[1]
         self.assertEqual(RUNTIME_DIR, repository_root / "runtime")
@@ -193,6 +202,43 @@ class LiepinCoreTests(unittest.TestCase):
     def test_maimai_smoke_test_is_hard_bounded_to_five_candidates(self) -> None:
         self.assertEqual(MaimaiRecruitPage.clean_optional_positive_int(5), 5)
         self.assertEqual(max(1, min(int(99 or 5), 5)), 5)
+
+    def test_maimai_unread_candidate_is_excluded_from_ai_and_contact(self) -> None:
+        page = object.__new__(MaimaiRecruitPage)
+        page.stop_event = page.progress_callback = None
+        cards = [{"name": name} for name in ("甲", "乙", "丙")]
+        page.wait_for_candidate_detail = Mock()
+        page.drawer_candidate_descriptors = Mock(return_value=cards)
+        page.open_drawer_candidate = Mock(side_effect=[cards[0], CandidateDetailError("详情未加载"), cards[2]])
+        page.extract_current_candidate_resume = lambda name: {"name": name}
+        page.analyze_current_page_candidates = Mock(side_effect=lambda rows, config: {"results": rows})
+        page.communicate_matched_candidates_on_current_page = Mock()
+        page.save_batch_summary = Mock()
+
+        results = page.extract_and_analyze_candidate_pages({"maimai_auto_communicate": True})
+
+        self.assertEqual([row["name"] for row in results], ["甲", "乙", "丙"])
+        self.assertEqual(results[1]["decision"], "unread")
+        for action in (page.analyze_current_page_candidates, page.communicate_matched_candidates_on_current_page):
+            self.assertEqual([row["page_candidate_index"] for row in action.call_args.args[0]], [1, 3])
+
+    def test_maimai_missing_ai_index_cannot_reuse_another_decision(self) -> None:
+        matcher = MaimaiAiMatcherMixin()
+        rows = [{"page_candidate_index": i} for i in (1, 3)]
+        decisions = matcher.normalize_ai_results({"results": [{"page_candidate_index": 3, "match": True}]}, rows)
+        self.assertEqual([item["match"] for item in decisions], [False, True])
+
+    def test_maimai_next_page_requires_confirmed_transition(self) -> None:
+        page = object.__new__(MaimaiRecruitPage)
+        page.stop_event = None
+        page.page = Mock()
+        page.page.run_js.return_value = {"clicked": True, "current": 2}
+        page.wait_for_candidate_page_changed = Mock(side_effect=RuntimeError("翻页超时"))
+        with self.assertRaisesRegex(RuntimeError, "翻页超时"):
+            page.goto_next_candidate_page("previous")
+        page.page.run_js.assert_called_once()
+        page.page.run_js.return_value = {"end": True}
+        self.assertFalse(page.goto_next_candidate_page("previous"))
 
     def test_liepin_and_maimai_ai_prompts_keep_different_shapes(self) -> None:
         requirements = "要有大客户销售经验，最好做过医疗行业"
@@ -574,10 +620,13 @@ class LiepinCoreTests(unittest.TestCase):
         self.assertTrue(all(item[2] for item in calls))
 
     def test_task_failure_creates_interruption_notification(self) -> None:
-        state = AppState()
-        task = state.data["tasks"][0]
-        with patch("recruit_assistant.app_backend.ensure_debug_browser_for_work", return_value=False):
-            state.run_task(task["id"], "测试")
+        with TemporaryDirectory() as directory, patch("recruit_assistant.app_backend.CONFIG_PATH", Path(directory) / "config.json"), patch(
+            "recruit_assistant.app_backend.LEGACY_CONFIG_PATH", Path(directory) / "legacy.json"
+        ):
+            state = AppState()
+            task = state.data["tasks"][0]
+            with patch("recruit_assistant.app_backend.ensure_debug_browser_for_work", return_value=False):
+                state.run_task(task["id"], "测试")
         notification = state.snapshot()["notifications"][-1]
         self.assertEqual(notification["title"], "任务中断")
         self.assertIn("浏览器调试端口", notification["message"])

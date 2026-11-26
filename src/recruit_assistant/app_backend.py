@@ -25,6 +25,7 @@ import urllib.request
 from urllib.parse import urlparse
 
 import psutil
+from DrissionPage import Chromium
 
 if __package__ in (None, ""):
     package_root = Path(__file__).resolve().parents[1]
@@ -37,6 +38,7 @@ if __package__ in (None, ""):
         normalize_model_for_provider,
     )
     from recruit_assistant.platforms.liepin import DEFAULT_MATCH_REQUIREMENTS, SEARCH_URL as LIEPIN_SEARCH_URL, LiepinSearchPage, SearchFilters
+    from recruit_assistant.platforms.liepin.browser import open_ordinary_search
     from recruit_assistant.platforms.maimai import DEFAULT_MAIMAI_GREETING, MAIMAI_TALENTS_URL, MaimaiRecruitPage
     from recruit_assistant.updater import check_for_update, download_update, launch_update_installer_and_exit
     from recruit_assistant.version import APP_VERSION
@@ -48,6 +50,7 @@ else:
         normalize_model_for_provider,
     )
     from .platforms.liepin import DEFAULT_MATCH_REQUIREMENTS, SEARCH_URL as LIEPIN_SEARCH_URL, LiepinSearchPage, SearchFilters
+    from .platforms.liepin.browser import open_ordinary_search
     from .platforms.maimai import DEFAULT_MAIMAI_GREETING, MAIMAI_TALENTS_URL, MaimaiRecruitPage
     from .updater import check_for_update, download_update, launch_update_installer_and_exit
     from .version import APP_VERSION
@@ -162,6 +165,10 @@ def connect_platform_page(url: str, port: int):
     page_target = next((item for item in targets if item.get("type") == "page" and item.get("webSocketDebuggerUrl")), None)
     if not page_target:
         raise RuntimeError("浏览器调试端口已就绪，但没有可切换的页面标签。")
+    if url == LIEPIN_SEARCH_URL:
+        tab = Chromium(f"127.0.0.1:{port}").get_tab(page_target["id"])
+        open_ordinary_search(tab, allow_login=True)
+        return tab.url
     ws = websocket.create_connection(page_target["webSocketDebuggerUrl"], timeout=5)
     try:
         ws.send(json.dumps({"id": 1, "method": "Page.navigate", "params": {"url": url}}, ensure_ascii=False))
@@ -497,6 +504,11 @@ def ensure_edge_debugging(port: int = DEFAULT_BROWSER_PORT, default_url: str | N
             try:
                 startup_log(f"trying browser candidate: {browser_path} extra={extra_args}")
                 if launch_browser_candidate(browser_path, profile_dir, port, extra_args, start_url=default_url or SEARCH_URL):
+                    if default_url == LIEPIN_SEARCH_URL:
+                        try:
+                            connect_platform_page(default_url, port)
+                        except Exception as exc:
+                            startup_log(f"default page navigation failed on new browser: {exc}")
                     return
             except Exception as exc:
                 startup_log(f"spawn failed for {browser_path} extra={extra_args}: {exc}")
@@ -876,6 +888,7 @@ class AppState:
                 str(result.get("asset_name") or ""),
                 APP_DIR,
                 progress_callback=on_progress,
+                expected_digest=str(result.get("asset_digest") or ""),
             )
             self.set_update_status(phase="installing", message="下载完成，正在退出并安装更新；完成后请手动重新打开软件", percent=100)
             self.add_log("更新已下载，软件即将退出并安装新版本；完成后请手动重新打开软件。")

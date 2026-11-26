@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -114,6 +115,7 @@ def check_for_update(repo: str = GITHUB_REPO, current_version: str = APP_VERSION
         "release_name": release.get("name") or latest_version,
         "asset_name": asset.get("name") if asset else "",
         "asset_url": asset.get("browser_download_url") if asset else "",
+        "asset_digest": (asset or {}).get("digest") or "",
         "source_url": source_url,
         "has_windows_asset": bool(asset),
     }
@@ -124,7 +126,7 @@ def safe_asset_name(name: str) -> str:
     return cleaned or "RecruitTool-update.exe"
 
 
-def download_update(asset_url: str, asset_name: str, app_dir: Path, progress_callback=None) -> Path:
+def download_update(asset_url: str, asset_name: str, app_dir: Path, progress_callback=None, *, expected_digest: str = "") -> Path:
     if not asset_url:
         raise RuntimeError("最新 Release 没有可下载的 Windows exe。")
     update_dir = app_dir / "runtime" / "updates"
@@ -138,15 +140,21 @@ def download_update(asset_url: str, asset_name: str, app_dir: Path, progress_cal
             with urllib.request.urlopen(request, timeout=45) as response:
                 total = int(response.headers.get("Content-Length") or "0")
                 downloaded = 0
+                digest = hashlib.sha256()
                 with temp_target.open("wb") as file:
                     while True:
                         chunk = response.read(1024 * 1024)
                         if not chunk:
                             break
                         file.write(chunk)
+                        digest.update(chunk)
                         downloaded += len(chunk)
                         if progress_callback:
                             progress_callback(downloaded, total, candidate)
+            if total and downloaded != total:
+                raise RuntimeError("更新文件下载不完整。")
+            if expected_digest and expected_digest.lower() != f"sha256:{digest.hexdigest()}":
+                raise RuntimeError("下载文件与 Release 公布的校验值不一致。")
             with temp_target.open("rb") as file:
                 signature = file.read(2)
             if signature != b"MZ" or temp_target.stat().st_size < 1024 * 1024:
